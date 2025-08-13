@@ -2702,48 +2702,6 @@ wheels = [
 ]
 
 [[package]]
-name = "test-vad"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "fastapi" },
-    { name = "funasr" },
-    { name = "ipykernel" },
-    { name = "jupyterplot" },
-    { name = "loguru" },
-    { name = "matplotlib" },
-    { name = "numpy" },
-    { name = "pip" },
-    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "scipy", version = "1.16.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "silero-vad" },
-    { name = "torch" },
-    { name = "torchaudio" },
-    { name = "tqdm" },
-    { name = "uvicorn" },
-    { name = "websockets" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "fastapi", specifier = ">=0.116.1" },
-    { name = "funasr", specifier = ">=1.2.6" },
-    { name = "ipykernel", specifier = ">=6.30.1" },
-    { name = "jupyterplot", specifier = "==0.0.3" },
-    { name = "loguru", specifier = ">=0.7.3" },
-    { name = "matplotlib", specifier = ">=3.6.0" },
-    { name = "numpy", specifier = ">=1.24.0" },
-    { name = "pip", specifier = ">=25.2" },
-    { name = "scipy", specifier = ">=1.15.3" },
-    { name = "silero-vad", specifier = ">=5.1.2" },
-    { name = "torch", specifier = ">=1.12.0" },
-    { name = "torchaudio", specifier = ">=0.12.0" },
-    { name = "tqdm", specifier = ">=4.67.1" },
-    { name = "uvicorn", specifier = ">=0.35.0" },
-    { name = "websockets", specifier = ">=15.0.1" },
-]
-
-[[package]]
 name = "threadpoolctl"
 version = "3.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3039,4 +2997,46 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/b3/8f/705086c9d734d3b663af0e9bb3d4de6578d08f46b1b101c2442fd9aecaa2/win32_setctime-1.2.0.tar.gz", hash = "sha256:ae1fdf948f5640aae05c511ade119313fb6a30d7eabe25fef9764dca5873c4c0", size = 4867, upload-time = "2024-12-07T15:28:28.314Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e1/07/c6fe3ad3e685340704d314d765b7912993bcb8dc198f0e7a89382d37974b/win32_setctime-1.2.0-py3-none-any.whl", hash = "sha256:95d644c4e708aba81dc3704a116d8cbc974d70b3bdb8be1d150e36be6e9d1390", size = 4083, upload-time = "2024-12-07T15:28:26.465Z" },
+]
+
+[[package]]
+name = "windowed-silero-vad"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "fastapi" },
+    { name = "funasr" },
+    { name = "ipykernel" },
+    { name = "jupyterplot" },
+    { name = "loguru" },
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "pip" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.16.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "silero-vad" },
+    { name = "torch" },
+    { name = "torchaudio" },
+    { name = "tqdm" },
+    { name = "uvicorn" },
+    { name = "websockets" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.116.1" },
+    { name = "funasr", specifier = ">=1.2.6" },
+    { name = "ipykernel", specifier = ">=6.30.1" },
+    { name = "jupyterplot", specifier = "==0.0.3" },
+    { name = "loguru", specifier = ">=0.7.3" },
+    { name = "matplotlib", specifier = ">=3.6.0" },
+    { name = "numpy", specifier = ">=1.24.0" },
+    { name = "pip", specifier = ">=25.2" },
+    { name = "scipy", specifier = ">=1.15.3" },
+    { name = "silero-vad", specifier = ">=5.1.2" },
+    { name = "torch", specifier = ">=1.12.0" },
+    { name = "torchaudio", specifier = ">=0.12.0" },
+    { name = "tqdm", specifier = ">=4.67.1" },
+    { name = "uvicorn", specifier = ">=0.35.0" },
+    { name = "websockets", specifier = ">=15.0.1" },
 ]

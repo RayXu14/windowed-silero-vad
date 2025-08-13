@@ -142,6 +142,8 @@ async def get_vad_results(wav_path, chunk_size=512):
             # 转换为float32并归一化
             if audio_data.dtype == np.int16:
                 audio_data = audio_data.astype(np.float32) / 32768.0
+            elif audio_data.dtype == np.float32:
+                pass
             else:
                 raise NotImplementedError('不被支持的数据类型')
             
