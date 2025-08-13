@@ -11,6 +11,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from silero_vad import load_silero_vad
 import uvicorn
 import logging
+import traceback
 from asr import asr, format_str_v3
 
 # 设置日志
@@ -98,7 +99,7 @@ class VADProcessor:
         """保存完整的语音段"""
         if not self.speech_segment_buffer:
             logger.warning("No speech segment to save")
-            return None
+            return None, None, None
         
         try:
             # 合并所有音频tensor
@@ -127,11 +128,11 @@ class VADProcessor:
             duration = len(merged_audio) / self.SAMPLING_RATE
             
             logger.info(f"Saved speech segment: {filename} (duration: {duration:.2f}s, samples: {start_sample}-{end_sample})")
-            return text
+            return text, json.dumps(asr_result[0], ensure_ascii=False), start_timestamp
         except Exception as e:
-            logger.error(f"Failed to save speech segment: {e}")
+            logger.error(f"Failed to save speech segment: {traceback.format_exc()}")
             # 即使保存失败也要清空缓冲区
-            return None
+            return None, None, None
         finally:
             self.speech_segment_buffer.clear()
     
@@ -154,6 +155,7 @@ class VADProcessor:
         
         # 将音频数据转换为numpy数组并添加到缓冲区
         new_audio = np.array(audio_data, dtype=self.DATA_TYPE)
+        # print(self.audio_buffer.shape, new_audio.shape)
         self.audio_buffer = np.concatenate([self.audio_buffer, new_audio])
         
         # 处理缓冲区中的完整音频块
@@ -215,7 +217,8 @@ class VADProcessor:
                         self.buffer_a.clear()  # 清空缓冲区A
                         # 合并缓冲区A的所有音频块一起发送
                         yield {
-                            "type": "vad"
+                            "type": "vad",
+                            'timestamp': self.speech_segment_buffer[0]['timestamp']
                         }
                         
                 # 在ACTIVE状态下hit
@@ -227,7 +230,8 @@ class VADProcessor:
                     self.buffer_b.clear()  # 清空缓冲区B
                 
                     yield {
-                        "type": "vad"
+                        "type": "vad",
+                        'timestamp': self.speech_segment_buffer[-1]['timestamp']
                     }
                         
             else:
@@ -243,19 +247,29 @@ class VADProcessor:
                 elif self.state == State.ACTIVE:
                 
                     yield {
-                        "type": "vad"
+                        "type": "vad",
+                        'timestamp': self.speech_segment_buffer[-1]['timestamp']
                     }
                     # 检查是否达到转换条件
                     if self.miss_count >= self.required_misses:
                         self.state = State.IDLE
                         # 保存完整的语音段
-                        text = self.transcrib_and_save_speech_segment()
-                        yield {
-                            'type': 'asr',
-                            'text': text,
-                        }
-                        logger.info(f'生成文本{text}')
-                        # 丢弃缓冲区B中的所有miss音频块
+                        text, full_info_str, asr_timestamp = self.transcrib_and_save_speech_segment()
+                        if text is None:
+                            logger.error('未能生成文本')
+                            yield {
+                                'type': 'error',
+                                'error': '未能生成文本，请查看服务器端状况'
+                            }
+                        else:
+                            yield {
+                                'type': 'asr',
+                                'text': text,
+                                'full_info_str': full_info_str,
+                                'timestamp': asr_timestamp
+                            }
+                            logger.info(f'生成文本：{text}')
+                            # 丢弃缓冲区B中的所有miss音频块
                         self.buffer_b.clear()
                     else:
                         # 将miss的音频块添加到缓冲区B
@@ -337,7 +351,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("WebSocket connection closed")
     except json.JSONDecodeError as e:
         # JSON解析错误应该报告给客户端
-        logger.error(f"JSON decode error: {str(e)}")
+        logger.error(f"JSON decode error: {traceback.format_exc()}")
         try:
             await websocket.send_json({
                 "type": "error",
@@ -346,11 +360,11 @@ async def websocket_endpoint(websocket: WebSocket):
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected while sending JSON error")
     except Exception as e:
-        logger.error(f"Error processing message: {str(e)}")
+        logger.error(f"Error processing message: {traceback.format_exc()}")
         try:
             await websocket.send_json({
                 "type": "error",
-                "error": f"Processing error: {str(e)}"
+                "error": f"Processing error: {traceback.format_exc()}"
             })
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected while sending processing error")
