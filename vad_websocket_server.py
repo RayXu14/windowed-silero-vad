@@ -47,6 +47,8 @@ class VADProcessor:
     def __init__(self, smoothing_window: int, prob_threshold: float, required_hits: int, required_misses: int, prebuffer: int, lang: str):
         # 加载VAD模型
         self.prob_model = load_silero_vad(onnx=True)
+        self.cache_asr = {}
+        self.lang = lang
 
         # 加载初始状态
         self.state = State.IDLE
@@ -71,16 +73,8 @@ class VADProcessor:
         self.hit_count = 0
         self.miss_count = 0
         
-        # 缓冲区A：IDLE状态下收集音频块，转换到ACTIVE时一起发送
-        self.buffer_a = []
-        
-        # 缓冲区B：ACTIVE状态下收集miss的音频块
-        self.buffer_b = []
-        
         # 语音段缓冲：收集完整语音段的音频数据
         self.speech_segment_buffer = []
-        self.cache_asr = {}
-        self.lang = lang
         
         # 保存目录和计数器
         self.save_dir = "saved_audio_segments"
@@ -196,59 +190,46 @@ class VADProcessor:
                 self.hit_count += 1
                 self.miss_count = 0  # 重置miss计数器
                 
-                # 在IDLE状态下hit，添加到缓冲区A
+                # 在IDLE状态下hit
                 if self.state == State.IDLE:
-                    self.buffer_a.append(current_chunk)
                     
                     # 检查是否达到转换条件
                     if self.hit_count >= self.required_hits:
                         self.state = State.ACTIVE
-                        
-                        # 从预缓冲队列前面取出prebuffer个音频块
-                        prebuffer_chunks = []
-                        for _ in range(min(self.prebuffer, len(self.prebuffer_queue) - self.required_hits)):
-                            if self.prebuffer_queue:
-                                prebuffer_chunks.append(self.prebuffer_queue.popleft())
-                        
-                        # 将预缓冲音频块和缓冲区A的音频添加到语音段缓冲
-                        self.speech_segment_buffer.extend(prebuffer_chunks)
-                        self.speech_segment_buffer.extend(self.buffer_a)
-                        
-                        self.buffer_a.clear()  # 清空缓冲区A
-                        # 合并缓冲区A的所有音频块一起发送
+
                         yield {
                             "type": "vad",
-                            'timestamp': self.speech_segment_buffer[0]['timestamp']
+                            'timestamp': self.prebuffer_queue[-self.hit_count]['timestamp']
                         }
+                        
+                        while self.prebuffer_queue:
+                            self.speech_segment_buffer.append(self.prebuffer_queue.popleft())
                         
                 # 在ACTIVE状态下hit
                 elif self.state == State.ACTIVE:
-                    # 如果缓冲区B有内容，合并发送
-                    chunks_to_send = self.buffer_b + [current_chunk]
-                    # 将所有音频块添加到语音段缓冲
-                    self.speech_segment_buffer.extend(chunks_to_send)
-                    self.buffer_b.clear()  # 清空缓冲区B
                 
                     yield {
                         "type": "vad",
-                        'timestamp': self.speech_segment_buffer[-1]['timestamp']
+                        'timestamp': current_chunk['timestamp']
                     }
+
+                    while self.prebuffer_queue:
+                        self.speech_segment_buffer.append(self.prebuffer_queue.popleft())
                         
             else:
                 self.miss_count += 1
                 self.hit_count = 0  # 重置hit计数器
                 
-                # 在IDLE状态下miss，不做任何处理（不添加到缓冲区）
+                # 在IDLE状态下miss，不做任何处理
                 if self.state == State.IDLE:
-                    # 清空缓冲区A，因为连续的hit被中断了
-                    self.buffer_a.clear()
+                    pass
                     
                 # 在ACTIVE状态下miss
                 elif self.state == State.ACTIVE:
                 
                     yield {
                         "type": "vad",
-                        'timestamp': self.speech_segment_buffer[-1]['timestamp']
+                        'timestamp': current_chunk['timestamp']
                     }
                     # 检查是否达到转换条件
                     if self.miss_count >= self.required_misses:
@@ -269,11 +250,6 @@ class VADProcessor:
                                 'timestamp': asr_timestamp
                             }
                             logger.info(f'生成文本：{text}')
-                            # 丢弃缓冲区B中的所有miss音频块
-                        self.buffer_b.clear()
-                    else:
-                        # 将miss的音频块添加到缓冲区B
-                        self.buffer_b.append(current_chunk)
 
 # 获取服务器信息的统一函数
 def get_server_info():

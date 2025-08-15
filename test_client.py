@@ -185,7 +185,7 @@ async def get_vad_results(wav_path, chunk_size=512):
         await client.close()
 
 if __name__ == "__main__":
-    wav_path = "exp_data/2025-07-29_16-15-16-756/equidistant_audio_records"
+    wav_path = "exp_data/untitled folder 2"
     
     print("开始VAD处理...")
     start_time = time.time()
