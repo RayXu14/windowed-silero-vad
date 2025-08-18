@@ -12,3 +12,4 @@ wheels/
 # experimented data
 exp_data
 saved_audio_segments
+vad_server.log

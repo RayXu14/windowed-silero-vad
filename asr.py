@@ -4,14 +4,7 @@ Modified from https://github.com/0x5446/api4sensevoice/blob/a924549f3e1041b381d7
 
 from funasr import AutoModel
 from loguru import logger
-import sys
 import time
-
-logger.remove()
-log_format = "{time:YYYY-MM-DD HH:mm:ss} [{level}] {file}:{line} - {message}"
-logger.add(sys.stdout, format=log_format, level="DEBUG", filter=lambda record: record["level"].no < 40)
-logger.add(sys.stderr, format=log_format, level="ERROR", filter=lambda record: record["level"].no >= 40)
-
 
 emo_dict = {
 	"<|HAPPY|>": "😊",

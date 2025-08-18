@@ -5,6 +5,7 @@ import websockets
 import os
 import time
 import torch
+from datetime import datetime
 from scipy.io import wavfile
 
 class SimpleVADClient:
@@ -60,8 +61,16 @@ class SimpleVADClient:
                         self.last_message_time = time.time()
                             
                     elif result.get("type") == "asr":
-                        print(f"语音转文本结果: {result.get('text')}")
-                        self.last_message_time = time.time()
+                        timestamp = result.get('timestamp')
+                        current_time = time.time()
+                        current_readable_time = datetime.fromtimestamp(current_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        
+                        if timestamp:
+                            readable_time = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                            print(f"语音转文本结果（语音段初始时间: {readable_time}, 当前时间: {current_readable_time}）: {result.get('text')}")
+                        else:
+                            print(f"语音转文本结果（服务器时间: 无时间戳, 当前时间: {current_readable_time}）: {result.get('text')}")
+                        self.last_message_time = current_time
                         
                     elif result.get("type") == "error":
                         print(f"服务器错误: {result.get('error')}")

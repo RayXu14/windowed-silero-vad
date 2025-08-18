@@ -10,13 +10,11 @@ from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from silero_vad import load_silero_vad
 import uvicorn
-import logging
-import traceback
+from loguru import logger
 from asr import asr, format_str_v3
 
-# 设置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 配置 loguru 日志 - 最简单配置：控制台 + 文件
+logger.add("vad_server.log")
 
 app = FastAPI(title="VAD WebSocket Server", version="1.0.0")
 
@@ -53,9 +51,8 @@ class VADProcessor:
         # 加载初始状态
         self.state = State.IDLE
         
-        # 音频缓冲区和采样点计数器
+        # 音频缓冲区
         self.audio_buffer = np.array([], dtype=self.DATA_TYPE)
-        self.sample_index = 0
 
         # 移动平均窗口和阈值
         self.prob_window = deque(maxlen=smoothing_window)
@@ -81,8 +78,6 @@ class VADProcessor:
         os.makedirs(self.save_dir, exist_ok=True)
         self.segment_counter = 0
         
-        # 音频块时间戳映射
-        self.audio_timestamps = {}  # sample_index -> timestamp
 
     def get_smooth_values(self, prob):
         self.prob_window.append(prob)
@@ -101,17 +96,13 @@ class VADProcessor:
             merged_audio = torch.cat(audio_tensors, dim=0)
             asr_result = asr(merged_audio, self.lang, self.cache_asr, use_itn=True)
             text = format_str_v3(asr_result[0]['text'])
-            # 获取语音段的采样点范围
-            start_sample = self.speech_segment_buffer[0]["start_sample"]
-            end_sample = self.speech_segment_buffer[-1]["end_sample"]
             
-            # 使用语音段开始时的客户端时间戳生成文件名
-            start_timestamp = self.speech_segment_buffer[0]["timestamp"]
+            start_timestamp = self.speech_segment_buffer[-1]["timestamp"]
             segment_datetime = datetime.fromtimestamp(start_timestamp)
             timestamp_str = segment_datetime.strftime("%Y%m%d_%H%M%S")
             
             self.segment_counter += 1
-            filename = f"segment_{timestamp_str}_{self.segment_counter:03d}_s{start_sample}-{end_sample}.wav"
+            filename = f"segment_{timestamp_str}_{self.segment_counter:03d}.wav"
             filepath = os.path.join(self.save_dir, filename)
             
             # 使用torchaudio保存音频文件
@@ -121,10 +112,10 @@ class VADProcessor:
             
             duration = len(merged_audio) / self.SAMPLING_RATE
             
-            logger.info(f"Saved speech segment: {filename} (duration: {duration:.2f}s, samples: {start_sample}-{end_sample})")
+            logger.info(f"Saved speech segment: {filename} (duration: {duration:.2f}s)")
             return text, json.dumps(asr_result[0], ensure_ascii=False), start_timestamp
         except Exception as e:
-            logger.error(f"Failed to save speech segment: {traceback.format_exc()}")
+            logger.opt(exception=True).error("Failed to save speech segment")
             # 即使保存失败也要清空缓冲区
             return None, None, None
         finally:
@@ -165,22 +156,13 @@ class VADProcessor:
             speech_prob = self.prob_model(audio_tensor, self.SAMPLING_RATE).item()
             smoothed_prob = self.get_smooth_values(speech_prob)
             
-            # 更新采样点计数器
-            self.sample_index += self.WINDOW_SIZE
-            
             # 状态管理逻辑
-            is_hit = speech_prob > self.prob_threshold
-            
-            # 计算当前音频块对应的时间戳
-            chunk_offset_seconds = (self.sample_index - self.WINDOW_SIZE) / self.SAMPLING_RATE
-            chunk_timestamp = timestamp + chunk_offset_seconds
+            is_hit = smoothed_prob > self.prob_threshold
             
             # 创建当前音频块的信息（包含torch tensor和时间戳）
             current_chunk = {
-                "start_sample": self.sample_index - self.WINDOW_SIZE,
-                "end_sample": self.sample_index - 1,
                 "audio_tensor": audio_tensor,
-                "timestamp": chunk_timestamp
+                "timestamp": timestamp  # 比较粗糙的时间戳
             }
             
             # 将当前音频块添加到预缓冲循环队列中（无论是否hit都要保存）
@@ -196,10 +178,13 @@ class VADProcessor:
                     # 检查是否达到转换条件
                     if self.hit_count >= self.required_hits:
                         self.state = State.ACTIVE
+                        
+                        # 获取语音段开始时间戳（使用第一个命中的音频块时间戳）
+                        speech_start_timestamp = self.prebuffer_queue[-self.hit_count]['timestamp']
 
                         yield {
                             "type": "vad",
-                            'timestamp': self.prebuffer_queue[-self.hit_count]['timestamp']
+                            'timestamp': speech_start_timestamp
                         }
                         
                         while self.prebuffer_queue:
@@ -327,7 +312,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("WebSocket connection closed")
     except json.JSONDecodeError as e:
         # JSON解析错误应该报告给客户端
-        logger.error(f"JSON decode error: {traceback.format_exc()}")
+        logger.opt(exception=True).error("JSON decode error")
         try:
             await websocket.send_json({
                 "type": "error",
@@ -336,11 +321,11 @@ async def websocket_endpoint(websocket: WebSocket):
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected while sending JSON error")
     except Exception as e:
-        logger.error(f"Error processing message: {traceback.format_exc()}")
+        logger.opt(exception=True).error("Error processing message")
         try:
             await websocket.send_json({
                 "type": "error",
-                "error": f"Processing error: {traceback.format_exc()}"
+                "error": f"Processing error: {str(e)}"
             })
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected while sending processing error")
@@ -356,7 +341,7 @@ if __name__ == "__main__":
                        help='日志级别')
     parser.add_argument('--prob-threshold', type=float, default=0.8, 
                        help='移动平均概率阈值，只有大于此值才返回结果')
-    parser.add_argument('--smoothing-window', type=int, default=5, 
+    parser.add_argument('--smoothing-window', type=int, default=1, 
                        help='移动平均窗口大小')
     parser.add_argument('--required-hits', type=int, default=5, 
                        help='从IDLE进入ACTIVE状态需要的连续命中次数')
@@ -381,12 +366,12 @@ if __name__ == "__main__":
     
     # 直接输出服务器信息
     server_info = get_server_info()
-    print("启动服务器...")
-    print(f"地址: http://{args.host}:{args.port}")
-    print(f"WebSocket 端点: ws://{args.host}:{args.port}{server_info['websocket_endpoint']}")
-    print(json.dumps(server_info, ensure_ascii=False, indent=2))
-    print("按 Ctrl+C 停止服务器")
-    print("-" * 50)
+    logger.info("启动服务器...")
+    logger.info(f"地址: http://{args.host}:{args.port}")
+    logger.info(f"WebSocket 端点: ws://{args.host}:{args.port}{server_info['websocket_endpoint']}")
+    logger.info(json.dumps(server_info, ensure_ascii=False, indent=2))
+    logger.info("按 Ctrl+C 停止服务器")
+    logger.info("-" * 50)
     
     uvicorn.run(
         app,
