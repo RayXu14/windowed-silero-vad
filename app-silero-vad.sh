@@ -15,6 +15,7 @@ REQUIRED_HITS=3                     # 语音检测所需的连续高概率次数
 REQUIRED_MISSES=16                    # 语音检测所需的连续低概率次数
 PREBUFFER=12                        # 缓冲队列长度
 VOLUME_THRESHOLD=-35                # 音量阈值
+ENABLE_SPEAKER_VERIFICATION="--enable_speaker_verification"   # 启用说话人验证选项 (可选)
 # ================================
 
 SERVICE_NAME_LOWER=$(echo "$SERVICE_NAME" | tr '[:upper:]' '[:lower:]')
@@ -64,6 +65,7 @@ start() {
         --required-misses $REQUIRED_MISSES \
         --prebuffer $PREBUFFER \
         --volume-threshold $VOLUME_THRESHOLD \
+        $ENABLE_SPEAKER_VERIFICATION \
         > $LOG_FILE 2>&1 & echo $! > $PID_FILE
 
     sleep 2
@@ -129,7 +131,8 @@ debug() {
         --required-hits $REQUIRED_HITS \
         --required-misses $REQUIRED_MISSES \
         --prebuffer $PREBUFFER \
-        --volume-threshold $VOLUME_THRESHOLD
+        --volume-threshold $VOLUME_THRESHOLD \
+        $ENABLE_SPEAKER_VERIFICATION
 }
 
 # 显示状态

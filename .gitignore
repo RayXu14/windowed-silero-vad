@@ -13,3 +13,9 @@ wheels/
 exp_data
 saved_audio_segments
 vad_server.log
+
+# speaker verification
+speaker
+
+# logs
+.silero-vad

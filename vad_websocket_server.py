@@ -12,6 +12,7 @@ from silero_vad import load_silero_vad
 import uvicorn
 from loguru import logger
 from asr import asr, format_str_v3
+from speaker_verification import EmbeddingManager, SystemConfig
 
 # 配置 loguru 日志 - 最简单配置：控制台 + 文件
 logger.add("vad_server.log")
@@ -27,6 +28,7 @@ class AppConfig:
     prebuffer = None
     lang = None
     volume_threshold = None  # 新增音量门限
+    enable_speaker_verification = None  # 声纹识别开关
 
 
 config = AppConfig()
@@ -55,7 +57,7 @@ class VADProcessor:
     CHANNELS = 1  # 单声道
     WINDOW_SIZE = 512 if SAMPLING_RATE == 16000 else 256  # 32ms * 16000 / 1000
 
-    def __init__(self, smoothing_window: int, prob_threshold: float, required_hits: int, required_misses: int, prebuffer: int, lang: str, volume_threshold: float):
+    def __init__(self, smoothing_window: int, prob_threshold: float, required_hits: int, required_misses: int, prebuffer: int, lang: str, volume_threshold: float, enable_speaker_verification: bool = False):
         # 加载VAD模型
         self.prob_model = load_silero_vad(onnx=True)
         self.cache_asr = {}
@@ -94,6 +96,13 @@ class VADProcessor:
         os.makedirs(self.save_dir, exist_ok=True)
         self.segment_counter = 0
 
+        # 声纹识别功能
+        self.enable_speaker_verification = enable_speaker_verification
+        if self.enable_speaker_verification:
+            self.speaker_config = SystemConfig()
+            self.embedding_manager = EmbeddingManager(self.speaker_config)
+            logger.info("声纹识别功能已启用")
+
     def get_smooth_values(self, prob):
         self.prob_window.append(prob)
         smoothed_prob = np.mean(self.prob_window)
@@ -109,6 +118,11 @@ class VADProcessor:
             # 合并所有音频tensor
             audio_tensors = [chunk["audio_tensor"] for chunk in self.speech_segment_buffer]
             merged_audio = torch.cat(audio_tensors, dim=0)
+            if self.enable_speaker_verification and self.embedding_manager:
+                audio_numpy = merged_audio.numpy()
+                hit, speaker_id, is_new_speaker = self.embedding_manager.verify_and_register(audio_numpy)
+            else:
+                speaker_id = ""
             asr_result = asr(merged_audio, self.lang, self.cache_asr, use_itn=True)
             text = format_str_v3(asr_result[0]['text'])
 
@@ -128,7 +142,7 @@ class VADProcessor:
             duration = len(merged_audio) / self.SAMPLING_RATE
 
             logger.info(f"Saved speech segment: {filename} (duration: {duration:.2f}s)")
-            return text, json.dumps(asr_result[0], ensure_ascii=False), start_timestamp
+            return text, json.dumps(asr_result[0], ensure_ascii=False), start_timestamp, speaker_id
         except Exception as e:
             logger.opt(exception=True).error("Failed to save speech segment")
             # 即使保存失败也要清空缓冲区
@@ -240,7 +254,7 @@ class VADProcessor:
                     if self.miss_count >= self.required_misses:
                         self.state = State.IDLE
                         # 保存完整的语音段
-                        text, full_info_str, asr_timestamp = self.transcrib_and_save_speech_segment()
+                        text, full_info_str, asr_timestamp, speaker_id = self.transcrib_and_save_speech_segment()
                         if text is None:
                             logger.error('未能生成文本')
                             yield {
@@ -252,7 +266,8 @@ class VADProcessor:
                                 'type': 'asr',
                                 'text': text,
                                 'full_info_str': full_info_str,
-                                'timestamp': asr_timestamp
+                                'timestamp': asr_timestamp,
+                                'speaker_id': speaker_id
                                 }
                             logger.info(f'生成文本：{text}')
 
@@ -293,6 +308,7 @@ async def websocket_endpoint(websocket: WebSocket):
         prebuffer=config.prebuffer,
         lang=config.lang,
         volume_threshold=config.volume_threshold,  # 新增参数
+        enable_speaker_verification=config.enable_speaker_verification  # 声纹识别开关
         )
     logger.info("WebSocket connection established with dedicated VAD processor")
 
@@ -377,6 +393,8 @@ if __name__ == "__main__":
                         help='ASR语言')
     parser.add_argument('--volume-threshold', type=float, default=-35.0,
                         help='音量门限值（分贝），低于此值的音频将被忽略')
+    parser.add_argument('--enable_speaker_verification', action='store_true',
+                        help='启用声纹识别功能')
 
     args = parser.parse_args()
 
@@ -390,6 +408,7 @@ if __name__ == "__main__":
     config.prebuffer = args.prebuffer
     config.lang = args.lang
     config.volume_threshold = args.volume_threshold  # 新增配置
+    config.enable_speaker_verification = args.enable_speaker_verification  # 声纹识别开关
 
     # 直接输出服务器信息
     server_info = get_server_info()
