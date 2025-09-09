@@ -19,3 +19,5 @@ speaker
 
 # logs
 .silero-vad
+.ipynb_checkpoints
+

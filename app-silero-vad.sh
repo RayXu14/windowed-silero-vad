@@ -14,7 +14,7 @@ PROB_THRESHOLD=0.4                  # 语音检测概率阈值
 REQUIRED_HITS=3                     # 语音检测所需的连续高概率次数
 REQUIRED_MISSES=16                    # 语音检测所需的连续低概率次数
 PREBUFFER=12                        # 缓冲队列长度
-VOLUME_THRESHOLD=-35                # 音量阈值
+VOLUME_THRESHOLD=-40                # 音量阈值
 ENABLE_SPEAKER_VERIFICATION="--enable_speaker_verification"   # 启用说话人验证选项 (可选)
 # ================================
 
