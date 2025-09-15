@@ -8,14 +8,15 @@ SERVICE_NAME="Silero-vad"           # 服务名称
 RUNTIME_DIR=".silero-vad"           # 运行时文件目录
 PYTHON_CMD="uv run"                 # Python执行命令 (可改为: uv run python, python3, conda run -n myenv python 等)
 SCRIPT_NAME="vad_websocket_server.py"         # 主脚本文件名
-DEFAULT_CUDA_DEVICE=4               # 默认CUDA设备号
+DEFAULT_CUDA_DEVICE=5               # 默认CUDA设备号
 PORT=50160                          # 服务端口
 PROB_THRESHOLD=0.4                  # 语音检测概率阈值
 REQUIRED_HITS=3                     # 语音检测所需的连续高概率次数
 REQUIRED_MISSES=16                    # 语音检测所需的连续低概率次数
 PREBUFFER=12                        # 缓冲队列长度
 VOLUME_THRESHOLD=-50                # 音量阈值
-ENABLE_SPEAKER_VERIFICATION="--enable_speaker_verification"   # 启用说话人验证选项 (可选)
+# ENABLE_SPEAKER_VERIFICATION="--enable_speaker_verification"   # 启用说话人验证选项 (可选)
+ENABLE_SPEAKER_VERIFICATION=""   # 启用说话人验证选项 (可选)
 # ================================
 
 SERVICE_NAME_LOWER=$(echo "$SERVICE_NAME" | tr '[:upper:]' '[:lower:]')
