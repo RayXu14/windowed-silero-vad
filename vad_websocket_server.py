@@ -14,9 +14,6 @@ from loguru import logger
 from asr import asr, format_str_v3
 from speaker_verification import EmbeddingManager, SystemConfig
 
-# 配置 loguru 日志 - 最简单配置：控制台 + 文件
-logger.add("vad_server.log")
-
 app = FastAPI(title="VAD WebSocket Server", version="1.0.0")
 
 # 应用配置
@@ -109,6 +106,7 @@ class VADProcessor:
         return smoothed_prob
 
     def transcrib_and_save_speech_segment(self):
+        bef_transcrib_ts = time.time()
         """保存完整的语音段"""
         if not self.speech_segment_buffer:
             logger.warning("No speech segment to save")
@@ -123,7 +121,9 @@ class VADProcessor:
                 hit, speaker_id, is_new_speaker = self.embedding_manager.verify_and_register(audio_numpy)
             else:
                 speaker_id = ""
+            bef_asr_ts = time.time()
             asr_result = asr(merged_audio, self.lang, self.cache_asr, use_itn=True)
+            after_asr_ts = time.time()
             text = format_str_v3(asr_result[0]['text'])
 
             start_timestamp = self.speech_segment_buffer[-1]["timestamp"]
@@ -141,7 +141,17 @@ class VADProcessor:
 
             duration = len(merged_audio) / self.SAMPLING_RATE
 
-            logger.info(f"Saved speech segment: {filename} (duration: {duration:.2f}s)")
+            all_done_ts = time.time()
+            received_ts = self.speech_segment_buffer[-1]["received_ts"]
+            bef_process_ts = self.speech_segment_buffer[-1]["bef_process_ts"]
+            logger.info(f"Saved speech segment: {filename} (duration: {duration:.3f}s)")
+            logger.info(f"""ASR 处理时间: {after_asr_ts - bef_asr_ts:.3f}s
+总时间: {all_done_ts - received_ts:.3f}s
+receive时间: {received_ts - start_timestamp:.3f}s
+receive到process前: {bef_process_ts - received_ts:.3f}s
+process到transcribe前: {bef_transcrib_ts - bef_process_ts:.3f}s
+transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
+""")
             return text, json.dumps(asr_result[0], ensure_ascii=False), start_timestamp, speaker_id
         except Exception as e:
             logger.opt(exception=True).error("Failed to save speech segment")
@@ -150,7 +160,7 @@ class VADProcessor:
         finally:
             self.speech_segment_buffer.clear()
 
-    def process_audio_chunk(self, audio_data, timestamp):
+    def process_audio_chunk(self, audio_data, timestamp, received_ts):
         """
         处理音频块，使用生成器逐个返回VAD结果
 
@@ -161,6 +171,7 @@ class VADProcessor:
         Yields:
             dict: VAD结果字典
         """
+        bef_process_ts = time.time()
         if not isinstance(audio_data, list):
             return
 
@@ -185,19 +196,27 @@ class VADProcessor:
             audio_tensor = torch.from_numpy(audio_chunk)
 
             # 使用prob_model计算语音概率
+            bef_vad_ts = time.time()
             speech_prob = self.prob_model(audio_tensor, self.SAMPLING_RATE).item()
+            after_vad_ts = time.time()
+            logger.trace(f"VAD 计算时间: {after_vad_ts - bef_vad_ts:.4f}s, 概率: {speech_prob:.4f}, 音量: {volume_db:.3f} dB")
             smoothed_prob = self.get_smooth_values(speech_prob)
 
             # 状态管理逻辑：同时考虑VAD概率和音量
             is_vad_hit = smoothed_prob > self.prob_threshold
             is_volume_sufficient = volume_db >= self.volume_threshold
             is_hit = is_vad_hit and is_volume_sufficient
+            logger.trace(f'is_hit: {is_hit}')
+            logger.trace(f'hit_count: {self.hit_count}')
+            logger.trace(f'miss_count: {self.miss_count}')
 
             # 创建当前音频块的信息（包含torch tensor和时间戳）
             current_chunk = {
                 "audio_tensor": audio_tensor,
-                "timestamp": timestamp  # 比较粗糙的时间戳
-                }
+                "timestamp": timestamp,  # 比较粗糙的时间戳
+                "received_ts": received_ts,
+                'bef_process_ts': bef_process_ts,
+            }
 
             # 将当前音频块添加到预缓冲循环队列中（无论是否hit都要保存）
             self.prebuffer_queue.append(current_chunk)
@@ -324,6 +343,8 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             message = await websocket.receive_json()
+            received_ts = time.time()
+            logger.trace(f"Received")
 
             if message.get("type") == "audio_chunk":
                 # 获取音频数据和时间戳
@@ -334,7 +355,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     continue
 
                 # 使用VAD处理器处理音频数据
-                vad_results = vad_processor.process_audio_chunk(audio_data, timestamp)
+                vad_results = vad_processor.process_audio_chunk(audio_data, timestamp, received_ts)
 
                 # 发送所有VAD结果
                 for result in vad_results:
@@ -377,8 +398,9 @@ if __name__ == "__main__":
     parser.add_argument('--host', default='0.0.0.0', help='服务器主机地址')
     parser.add_argument('--port', type=int, default=8000, help='服务器端口')
     parser.add_argument('--reload', action='store_true', help='启用自动重载')
-    parser.add_argument('--log-level', default='info', choices=['debug', 'info', 'warning', 'error'],
-                        help='日志级别')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'TRACE'],
+                        help='日志文件日志级别（STDOUT不受影响）')
+    parser.add_argument('--uvicorn-log-level', default='info')
     parser.add_argument('--prob-threshold', type=float, default=0.8,
                         help='移动平均概率阈值，只有大于此值才返回结果')
     parser.add_argument('--smoothing-window', type=int, default=1,
@@ -399,6 +421,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert args.prebuffer + args.required_hits <= args.required_misses
+
+    # 配置 loguru 日志 - 最简单配置：控制台 + 文件
+    logger.add("vad_server.log", level=args.log_level)
 
     # 设置全局配置
     config.prob_threshold = args.prob_threshold
@@ -424,5 +449,5 @@ if __name__ == "__main__":
         host=args.host,
         port=args.port,
         reload=args.reload,
-        log_level=args.log_level
+        log_level=args.uvicorn_log_level
         )
