@@ -18,6 +18,7 @@ vad_server.log
 speaker
 
 # logs
-.silero-vad
 .ipynb_checkpoints
+/logs/
 
+.DS_Store
