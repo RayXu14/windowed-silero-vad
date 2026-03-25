@@ -180,7 +180,7 @@ receive到process前: {bef_process_ts - received_ts:.3f}s
 process到transcribe前: {bef_transcrib_ts - bef_process_ts:.3f}s
 transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
 """)
-            full_info_str = json.dumps(asr_response, ensure_ascii=False)
+            full_info_str = json.dumps(asr_response["results"][0], ensure_ascii=False)
             return text, full_info_str, start_timestamp, speaker_id
         except Exception as e:
             logger.opt(exception=True).error("Failed to save speech segment")

@@ -4,11 +4,12 @@ SenseVoice ASR REST API 服务
 接口规范：
     POST /asr/transcribe
     请求：{ "audio_base64": "...", "format": "wav", "language": "zh" }
-    响应：{ "results": [{"text": "...", "language": "zh"}], "elapsed_ms": 310.2 }
+    响应：{ "results": [{"text": "...", "language": "zh", "emotion": "NEUTRAL", "event": "Speech", "itn": true}], "elapsed_ms": 310.2 }
 """
 
 import base64
 import io
+import re
 import time
 
 import torch
@@ -37,6 +38,9 @@ class TranscribeRequest(BaseModel):
 class TranscribeResultItem(BaseModel):
     text: str
     language: str
+    emotion: str
+    event: str
+    itn: bool
 
 
 class TranscribeResponse(BaseModel):
@@ -94,15 +98,38 @@ def transcribe(request: TranscribeRequest):
     raw_text = result[0]["text"]
     cleaned_text = format_str_v3(raw_text)
 
-    # 从 SenseVoice 结果中提取语言标签
+    # 解析 SenseVoice 结构化标签: <|lang|><|emotion|><|event|><|itn|>text
+    tags = re.findall(r"<\|([^|]+)\|>", raw_text)
+
+    LANGUAGES = {"zh", "en", "ja", "ko", "yue", "nospeech"}
+    EMOTIONS = {"HAPPY", "SAD", "ANGRY", "NEUTRAL", "FEARFUL", "DISGUSTED", "SURPRISED", "EMO_UNKNOWN"}
+    EVENTS = {"BGM", "Speech", "Applause", "Laughter", "Cry", "Sneeze", "Breath", "Cough", "Sing", "Speech_Noise", "Event_UNK"}
+
     detected_lang = lang
-    for tag in ["<|zh|>", "<|en|>", "<|ja|>", "<|ko|>", "<|yue|>"]:
-        if tag in raw_text:
-            detected_lang = tag[2:-2]
-            break
+    detected_emotion = "NEUTRAL"
+    detected_event = "Speech"
+    detected_itn = False
+
+    for tag in tags:
+        if tag in LANGUAGES:
+            detected_lang = tag
+        elif tag in EMOTIONS:
+            detected_emotion = tag
+        elif tag in EVENTS:
+            detected_event = tag
+        elif tag == "withitn":
+            detected_itn = True
+        elif tag == "woitn":
+            detected_itn = False
 
     return TranscribeResponse(
-        results=[TranscribeResultItem(text=cleaned_text, language=detected_lang)],
+        results=[TranscribeResultItem(
+            text=cleaned_text,
+            language=detected_lang,
+            emotion=detected_emotion,
+            event=detected_event,
+            itn=detected_itn,
+        )],
         elapsed_ms=round(elapsed_ms, 2),
     )
 
