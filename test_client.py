@@ -61,15 +61,17 @@ class SimpleVADClient:
                         self.last_message_time = time.time()
                             
                     elif result.get("type") == "asr":
+                        asr_result = result.get('asr_result', {})
                         timestamp = result.get('timestamp')
+                        speaker_id = result.get('speaker_id', '')
                         current_time = time.time()
                         current_readable_time = datetime.fromtimestamp(current_time).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                         
-                        if timestamp:
-                            readable_time = datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                            print(f"语音转文本结果（语音段初始时间: {readable_time}, 当前时间: {current_readable_time}）: {result.get('text')}")
-                        else:
-                            print(f"语音转文本结果（服务器时间: 无时间戳, 当前时间: {current_readable_time}）: {result.get('text')}")
+                        time_info = f"语音段初始时间: {datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}" if timestamp else "无时间戳"
+                        speaker_info = f" 说话人: {speaker_id}" if speaker_id else ""
+                        print(f"[ASR] ({time_info}, 当前: {current_readable_time}{speaker_info})")
+                        print(f"  文本: {asr_result.get('text', '')}")
+                        print(f"  语言: {asr_result.get('language', '?')} | 情绪: {asr_result.get('emotion', '?')} | 事件: {asr_result.get('event', '?')} | ITN: {asr_result.get('itn', '?')}")
                         self.last_message_time = current_time
                         
                     elif result.get("type") == "error":

@@ -154,7 +154,7 @@ class VADProcessor:
             bef_asr_ts = time.time()
             asr_response = self.call_asr_api(merged_audio)
             after_asr_ts = time.time()
-            text = asr_response["results"][0]["text"]
+            asr_result = asr_response["results"][0]
 
             start_timestamp = self.speech_segment_buffer[-1]["timestamp"]
             segment_datetime = datetime.fromtimestamp(start_timestamp)
@@ -180,8 +180,7 @@ receive到process前: {bef_process_ts - received_ts:.3f}s
 process到transcribe前: {bef_transcrib_ts - bef_process_ts:.3f}s
 transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
 """)
-            full_info_str = json.dumps(asr_response["results"][0], ensure_ascii=False)
-            return text, full_info_str, start_timestamp, speaker_id
+            return asr_result, start_timestamp, speaker_id
         except Exception as e:
             logger.opt(exception=True).error("Failed to save speech segment")
             return None, None, None
@@ -301,8 +300,8 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
                     if self.miss_count >= self.required_misses:
                         self.state = State.IDLE
                         # 保存完整的语音段
-                        text, full_info_str, asr_timestamp, speaker_id = self.transcrib_and_save_speech_segment()
-                        if text is None:
+                        asr_result, asr_timestamp, speaker_id = self.transcrib_and_save_speech_segment()
+                        if asr_result is None:
                             logger.error('未能生成文本')
                             yield {
                                 'type': 'error',
@@ -311,12 +310,11 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
                         else:
                             yield {
                                 'type': 'asr',
-                                'text': text,
-                                'full_info_str': full_info_str,
+                                'asr_result': asr_result,
                                 'timestamp': asr_timestamp,
                                 'speaker_id': speaker_id
                                 }
-                            logger.info(f'生成文本：{text}')
+                            logger.info(f'生成文本：{asr_result["text"]}')
 
 
 # 获取服务器信息的统一函数

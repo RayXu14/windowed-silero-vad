@@ -98,10 +98,14 @@ class RealtimeVADClient:
                 pass
             elif msg_type == "asr":
                 now = datetime.now().strftime("%H:%M:%S")
-                text = result.get("text", "")
+                asr_result = result.get("asr_result", {})
                 speaker = result.get("speaker_id", "")
                 prefix = f"[{speaker}] " if speaker else ""
-                print(f"[{now}] {prefix}{text}")
+                emotion = asr_result.get("emotion", "")
+                event = asr_result.get("event", "")
+                lang = asr_result.get("language", "")
+                tags = f"({lang}|{emotion}|{event})" if any([emotion, event, lang]) else ""
+                print(f"[{now}] {prefix}{asr_result.get('text', '')} {tags}")
             elif msg_type == "error":
                 print(f"[错误] {result.get('error')}")
             elif msg_type == "status":
@@ -113,7 +117,7 @@ class RealtimeVADClient:
 
 def main():
     parser = argparse.ArgumentParser(description="实时麦克风 VAD+ASR 测试客户端")
-    parser.add_argument("--uri", default="ws://localhost:8000/ws", help="VAD WebSocket 服务地址")
+    parser.add_argument("--uri", default="ws://localhost:50160/ws", help="VAD WebSocket 服务地址")
     args = parser.parse_args()
 
     client = RealtimeVADClient(args.uri)
