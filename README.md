@@ -1,28 +1,18 @@
-## 文件说明
+## 启动服务
 
-### vad_websocket_server.py
-VAD WebSocket 服务器，提供实时语音检测服务。
-
-**使用方法：**
 ```bash
-# 启动服务器
-uv run vad_websocket_server.py
+# 1. 启动 ASR 服务（或使用其他兼容 POST /asr/transcribe 接口的服务）
+uv run asr_server.py --port 50300
 
-# 自定义参数启动示例（更多参数详见文件内命令行参数设定）
-uv run vad_websocket_server.py --port 8000 --prob-threshold 0.8
+# 2. 启动 VAD WebSocket 服务，指向 ASR 服务
+uv run vad_websocket_server.py --asr-url http://localhost:50300
+
+# 3. 实时麦克风测试
+uv run test_realtime_client.py
+
+# 或离线 WAV 文件测试
+uv run test_client.py /path/to/wav/dir
 ```
-
-### test_client.py
-VAD 客户端测试程序，连接服务器并发送若干个wav文件拼合而成的音频数据进行检测。
-
-**使用方法：**
-```bash
-# 运行客户端（需要先启动服务器）
-uv run test_client.py
-```
-
-### analyze_wav.ipynb
-用于分析 WAV 文件（分贝分布）和测试 VAD 模型效果（概率分布、延迟分布）
 
 ## 安装依赖
 

@@ -1,3 +1,5 @@
+import base64
+import io
 from collections import deque
 from enum import Enum
 import json
@@ -9,9 +11,9 @@ import torchaudio
 from datetime import datetime
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from silero_vad import load_silero_vad
+import httpx
 import uvicorn
 from loguru import logger
-from asr import asr, format_str_v3
 from speaker_verification import EmbeddingManager, SystemConfig
 
 app = FastAPI(title="VAD WebSocket Server", version="1.0.0")
@@ -24,8 +26,9 @@ class AppConfig:
     required_misses = None
     prebuffer = None
     lang = None
-    volume_threshold = None  # 新增音量门限
-    enable_speaker_verification = None  # 声纹识别开关
+    volume_threshold = None
+    enable_speaker_verification = None
+    asr_url = None
 
 
 config = AppConfig()
@@ -54,11 +57,12 @@ class VADProcessor:
     CHANNELS = 1  # 单声道
     WINDOW_SIZE = 512 if SAMPLING_RATE == 16000 else 256  # 32ms * 16000 / 1000
 
-    def __init__(self, smoothing_window: int, prob_threshold: float, required_hits: int, required_misses: int, prebuffer: int, lang: str, volume_threshold: float, enable_speaker_verification: bool = False):
+    def __init__(self, smoothing_window: int, prob_threshold: float, required_hits: int, required_misses: int, prebuffer: int, lang: str, volume_threshold: float, asr_url: str, enable_speaker_verification: bool = False):
         # 加载VAD模型
         self.prob_model = load_silero_vad(onnx=True)
-        self.cache_asr = {}
         self.lang = lang
+        self.asr_url = asr_url
+        self.http_client = httpx.Client(timeout=30.0)
 
         # 加载初始状态
         self.state = State.IDLE
@@ -105,9 +109,34 @@ class VADProcessor:
         smoothed_prob = np.mean(self.prob_window)
         return smoothed_prob
 
+    @staticmethod
+    def encode_audio_to_base64_wav(audio_tensor: torch.Tensor, sample_rate: int) -> str:
+        """将 torch tensor 编码为 base64 WAV 字符串"""
+        buf = io.BytesIO()
+        torchaudio.save(buf, audio_tensor.unsqueeze(0), sample_rate, format="wav")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    def call_asr_api(self, merged_audio: torch.Tensor) -> dict:
+        """调用远程 ASR REST API，返回响应 JSON"""
+        bef_encode_ts = time.time()
+        audio_b64 = self.encode_audio_to_base64_wav(merged_audio, self.SAMPLING_RATE)
+        after_encode_ts = time.time()
+        logger.info(f"音频编码耗时: {(after_encode_ts - bef_encode_ts) * 1000:.2f}ms (音频时长: {len(merged_audio) / self.SAMPLING_RATE:.2f}s, base64大小: {len(audio_b64) / 1024:.1f}KB)")
+        lang = self.lang if self.lang != "auto" else None
+        response = self.http_client.post(
+            f"{self.asr_url}/asr/transcribe",
+            json={
+                "audio_base64": audio_b64,
+                "format": "wav",
+                "language": lang,
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
     def transcrib_and_save_speech_segment(self):
         bef_transcrib_ts = time.time()
-        """保存完整的语音段"""
+        """转写并保存完整的语音段"""
         if not self.speech_segment_buffer:
             logger.warning("No speech segment to save")
             return None, None, None
@@ -121,10 +150,11 @@ class VADProcessor:
                 hit, speaker_id, is_new_speaker = self.embedding_manager.verify_and_register(audio_numpy)
             else:
                 speaker_id = ""
+
             bef_asr_ts = time.time()
-            asr_result = asr(merged_audio, self.lang, self.cache_asr, use_itn=True)
+            asr_response = self.call_asr_api(merged_audio)
             after_asr_ts = time.time()
-            text = format_str_v3(asr_result[0]['text'])
+            text = asr_response["results"][0]["text"]
 
             start_timestamp = self.speech_segment_buffer[-1]["timestamp"]
             segment_datetime = datetime.fromtimestamp(start_timestamp)
@@ -134,8 +164,6 @@ class VADProcessor:
             filename = f"segment_{timestamp_str}_{self.segment_counter:03d}.wav"
             filepath = os.path.join(self.save_dir, filename)
 
-            # 使用torchaudio保存音频文件
-            # 需要添加 batch维度 (1, samples)
             audio_to_save = merged_audio.unsqueeze(0)
             torchaudio.save(filepath, audio_to_save, self.SAMPLING_RATE)
 
@@ -152,10 +180,10 @@ receive到process前: {bef_process_ts - received_ts:.3f}s
 process到transcribe前: {bef_transcrib_ts - bef_process_ts:.3f}s
 transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
 """)
-            return text, json.dumps(asr_result[0], ensure_ascii=False), start_timestamp, speaker_id
+            full_info_str = json.dumps(asr_response, ensure_ascii=False)
+            return text, full_info_str, start_timestamp, speaker_id
         except Exception as e:
             logger.opt(exception=True).error("Failed to save speech segment")
-            # 即使保存失败也要清空缓冲区
             return None, None, None
         finally:
             self.speech_segment_buffer.clear()
@@ -326,8 +354,9 @@ async def websocket_endpoint(websocket: WebSocket):
         required_misses=config.required_misses,
         prebuffer=config.prebuffer,
         lang=config.lang,
-        volume_threshold=config.volume_threshold,  # 新增参数
-        enable_speaker_verification=config.enable_speaker_verification  # 声纹识别开关
+        volume_threshold=config.volume_threshold,
+        asr_url=config.asr_url,
+        enable_speaker_verification=config.enable_speaker_verification,
         )
     logger.info("WebSocket connection established with dedicated VAD processor")
 
@@ -401,22 +430,24 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'TRACE'],
                         help='日志文件日志级别（STDOUT不受影响）')
     parser.add_argument('--uvicorn-log-level', default='info')
-    parser.add_argument('--prob-threshold', type=float, default=0.8,
+    parser.add_argument('--prob-threshold', type=float, default=0.8,  # app.sh旧值: 0.4
                         help='移动平均概率阈值，只有大于此值才返回结果')
     parser.add_argument('--smoothing-window', type=int, default=1,
                         help='移动平均窗口大小')
-    parser.add_argument('--required-hits', type=int, default=5,
+    parser.add_argument('--required-hits', type=int, default=5,  # app.sh旧值: 3
                         help='从IDLE进入ACTIVE状态需要的连续命中次数')
     parser.add_argument('--required-misses', type=int, default=16,
                         help='从ACTIVE进入IDLE状态需要的连续未命中次数')
-    parser.add_argument('--prebuffer', type=int, default=10,
+    parser.add_argument('--prebuffer', type=int, default=10,  # app.sh旧值: 12
                         help='从IDLE转换到ACTIVE时包含的之前音频块数量')
     parser.add_argument('--lang', type=str, default='auto',
                         help='ASR语言')
-    parser.add_argument('--volume-threshold', type=float, default=-35.0,
+    parser.add_argument('--volume-threshold', type=float, default=-35.0,  # app.sh旧值: -50
                         help='音量门限值（分贝），低于此值的音频将被忽略')
     parser.add_argument('--enable_speaker_verification', action='store_true',
                         help='启用声纹识别功能')
+    parser.add_argument('--asr-url', type=str, required=True,
+                        help='ASR REST API 服务地址，例如 http://localhost:50300')
 
     args = parser.parse_args()
 
@@ -432,8 +463,9 @@ if __name__ == "__main__":
     config.required_misses = args.required_misses
     config.prebuffer = args.prebuffer
     config.lang = args.lang
-    config.volume_threshold = args.volume_threshold  # 新增配置
-    config.enable_speaker_verification = args.enable_speaker_verification  # 声纹识别开关
+    config.volume_threshold = args.volume_threshold
+    config.enable_speaker_verification = args.enable_speaker_verification
+    config.asr_url = args.asr_url.rstrip("/")
 
     # 直接输出服务器信息
     server_info = get_server_info()

@@ -194,12 +194,28 @@ async def get_vad_results(wav_path, chunk_size=512):
         await client.close()
 
 if __name__ == "__main__":
-    wav_path = "exp_data/untitled folder 2"
-    
-    print("开始VAD处理...")
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="VAD WebSocket 离线测试客户端")
+    parser.add_argument("wav_path", help="包含 WAV 文件的目录路径")
+    parser.add_argument("--chunk-size", type=int, default=320, help="音频块大小（采样点数）")
+    parser.add_argument("--uri", default="ws://localhost:8000/ws", help="VAD WebSocket 服务地址")
+    args = parser.parse_args()
+
+    if not os.path.isdir(args.wav_path):
+        print(f"错误: 目录不存在: {args.wav_path}", file=sys.stderr)
+        sys.exit(1)
+    wav_files = [f for f in os.listdir(args.wav_path) if f.endswith('.wav') and not f.startswith('.')]
+    if not wav_files:
+        print(f"错误: 目录中没有 WAV 文件: {args.wav_path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"开始VAD处理... (找到 {len(wav_files)} 个 WAV 文件)")
+    print("注意: 需要先启动 ASR 服务和 VAD WebSocket 服务")
     start_time = time.time()
     
-    asyncio.run(get_vad_results(wav_path, chunk_size=320))
+    asyncio.run(get_vad_results(args.wav_path, chunk_size=args.chunk_size))
     
     end_time = time.time()
     total_time = end_time - start_time
