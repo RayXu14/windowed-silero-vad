@@ -5,7 +5,7 @@
 uv run asr_server.py --port 50300
 
 # 2. 启动 VAD WebSocket 服务，指向 ASR 服务
-uv run vad_websocket_server.py --asr-url http://localhost:50300
+uv run vad_websocket_server.py --asr-url http://localhost:50300 --port 50160
 
 # 3. 实时麦克风测试
 uv run test_realtime_client.py
