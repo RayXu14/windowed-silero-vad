@@ -428,19 +428,19 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'TRACE'],
                         help='日志文件日志级别（STDOUT不受影响）')
     parser.add_argument('--uvicorn-log-level', default='info')
-    parser.add_argument('--prob-threshold', type=float, default=0.8,  # app.sh旧值: 0.4
+    parser.add_argument('--prob-threshold', type=float, default=0.4,  # 旧值: 0.8
                         help='移动平均概率阈值，只有大于此值才返回结果')
     parser.add_argument('--smoothing-window', type=int, default=1,
                         help='移动平均窗口大小')
-    parser.add_argument('--required-hits', type=int, default=5,  # app.sh旧值: 3
+    parser.add_argument('--required-hits', type=int, default=3,  # 旧值: 5
                         help='从IDLE进入ACTIVE状态需要的连续命中次数')
     parser.add_argument('--required-misses', type=int, default=16,
                         help='从ACTIVE进入IDLE状态需要的连续未命中次数')
-    parser.add_argument('--prebuffer', type=int, default=10,  # app.sh旧值: 12
+    parser.add_argument('--prebuffer', type=int, default=12,  # 旧值: 10
                         help='从IDLE转换到ACTIVE时包含的之前音频块数量')
     parser.add_argument('--lang', type=str, default='auto',
                         help='ASR语言')
-    parser.add_argument('--volume-threshold', type=float, default=-35.0,  # app.sh旧值: -50
+    parser.add_argument('--volume-threshold', type=float, default=-50.0,  # 旧值: -35
                         help='音量门限值（分贝），低于此值的音频将被忽略')
     parser.add_argument('--enable_speaker_verification', action='store_true',
                         help='启用声纹识别功能')
