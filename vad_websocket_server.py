@@ -21,14 +21,20 @@ app = FastAPI(title="VAD WebSocket Server", version="1.0.0")
 # 应用配置
 class AppConfig:
     prob_threshold = None
+    exit_prob_threshold = None
     smoothing_window = None
     required_hits = None
     required_misses = None
     prebuffer = None
     lang = None
     volume_threshold = None
+    snr_margin_db = None
+    active_snr_margin_db = None
+    noise_floor_window = None
+    noise_update_prob_threshold = None
     enable_speaker_verification = None
     asr_url = None
+    vad_silence_threshold = None
 
 
 config = AppConfig()
@@ -48,6 +54,81 @@ def calculate_db(chunk):
         return -80.0  # 返回一个合理的静音分贝值而不是负无穷
 
 
+def calculate_audio_features(chunk):
+    """计算 VAD 决策使用的帧级音频特征，不修改音频波形。"""
+    abs_chunk = np.abs(chunk)
+    return {
+        "volume_db": calculate_db(chunk),
+        "peak": float(abs_chunk.max()) if len(abs_chunk) else 0.0,
+        "mean_abs": float(abs_chunk.mean()) if len(abs_chunk) else 0.0,
+    }
+
+
+class VADDecisionGate:
+    """基于 Silero 概率、帧能量和自适应噪声底的 VAD 命中判定。"""
+
+    def __init__(
+        self,
+        enter_prob_threshold: float,
+        exit_prob_threshold: float,
+        min_volume_db: float,
+        snr_margin_db: float,
+        active_snr_margin_db: float,
+        noise_floor_window: int,
+        noise_update_prob_threshold: float,
+    ):
+        self.enter_prob_threshold = enter_prob_threshold
+        self.exit_prob_threshold = exit_prob_threshold
+        self.min_volume_db = min_volume_db
+        self.snr_margin_db = snr_margin_db
+        self.active_snr_margin_db = active_snr_margin_db
+        self.noise_update_prob_threshold = noise_update_prob_threshold
+        self.noise_floor_db_values = deque(maxlen=noise_floor_window)
+
+    def _noise_floor_db(self):
+        if not self.noise_floor_db_values:
+            return None
+        return float(np.percentile(self.noise_floor_db_values, 20))
+
+    def _energy_threshold(self, state):
+        noise_floor_db = self._noise_floor_db()
+        if noise_floor_db is None:
+            return self.min_volume_db, None
+
+        margin_db = self.snr_margin_db if state == State.IDLE else self.active_snr_margin_db
+        return max(self.min_volume_db, noise_floor_db + margin_db), noise_floor_db
+
+    def _update_noise_floor(self, volume_db):
+        self.noise_floor_db_values.append(volume_db)
+
+    def decide(self, state, smoothed_prob, features):
+        volume_db = features["volume_db"]
+        energy_threshold_db, noise_floor_db = self._energy_threshold(state)
+
+        if state == State.IDLE:
+            prob_threshold = self.enter_prob_threshold
+            is_prob_hit = smoothed_prob > prob_threshold
+            is_energy_hit = volume_db >= energy_threshold_db
+            is_hit = is_prob_hit and is_energy_hit
+
+            if not is_hit and smoothed_prob <= self.noise_update_prob_threshold:
+                self._update_noise_floor(volume_db)
+        else:
+            prob_threshold = self.exit_prob_threshold
+            is_prob_hit = smoothed_prob > prob_threshold
+            is_energy_hit = volume_db >= energy_threshold_db
+            is_hit = is_prob_hit and is_energy_hit
+
+        return {
+            "is_hit": is_hit,
+            "prob_threshold": prob_threshold,
+            "is_prob_hit": is_prob_hit,
+            "energy_threshold_db": energy_threshold_db,
+            "is_energy_hit": is_energy_hit,
+            "noise_floor_db": noise_floor_db,
+        }
+
+
 class VADProcessor:
     """VAD处理器类，封装VAD计算过程"""
 
@@ -57,7 +138,24 @@ class VADProcessor:
     CHANNELS = 1  # 单声道
     WINDOW_SIZE = 512 if SAMPLING_RATE == 16000 else 256  # 32ms * 16000 / 1000
 
-    def __init__(self, smoothing_window: int, prob_threshold: float, required_hits: int, required_misses: int, prebuffer: int, lang: str, volume_threshold: float, asr_url: str, enable_speaker_verification: bool = False):
+    def __init__(
+        self,
+        smoothing_window: int,
+        prob_threshold: float,
+        exit_prob_threshold: float,
+        required_hits: int,
+        required_misses: int,
+        prebuffer: int,
+        lang: str,
+        volume_threshold: float,
+        snr_margin_db: float,
+        active_snr_margin_db: float,
+        noise_floor_window: int,
+        noise_update_prob_threshold: float,
+        asr_url: str,
+        vad_silence_threshold: float,
+        enable_speaker_verification: bool = False,
+    ):
         # 加载VAD模型
         self.prob_model = load_silero_vad(onnx=True)
         self.lang = lang
@@ -74,8 +172,19 @@ class VADProcessor:
         self.prob_window = deque(maxlen=smoothing_window)
         self.prob_threshold = prob_threshold
 
-        # 音量门限
-        self.volume_threshold = volume_threshold
+        # VAD 命中决策：进入语音段时门槛更高，语音段内门槛更宽松
+        self.decision_gate = VADDecisionGate(
+            enter_prob_threshold=prob_threshold,
+            exit_prob_threshold=exit_prob_threshold,
+            min_volume_db=volume_threshold,
+            snr_margin_db=snr_margin_db,
+            active_snr_margin_db=active_snr_margin_db,
+            noise_floor_window=noise_floor_window,
+            noise_update_prob_threshold=noise_update_prob_threshold,
+        )
+
+        # 兼容旧启动参数；新逻辑不再对 VAD 音频做逐采样点硬置零
+        self.vad_silence_threshold = vad_silence_threshold
 
         # 状态转换参数
         self.required_hits = required_hits
@@ -88,6 +197,10 @@ class VADProcessor:
         # 状态转换计数器
         self.hit_count = 0
         self.miss_count = 0
+
+        # VAD 决策诊断日志（每 N 次打印一次，便于调试自适应门限）
+        self._vad_chunk_log_counter = 0
+        self._vad_chunk_log_interval = 50
 
         # 语音段缓冲：收集完整语音段的音频数据
         self.speech_segment_buffer = []
@@ -212,27 +325,39 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
 
         # 处理缓冲区中的完整音频块
         while len(self.audio_buffer) >= self.WINDOW_SIZE:
-            # 提取一个完整的音频块
+            # 提取一个完整的音频块（原始，用于 ASR）
             audio_chunk = self.audio_buffer[:self.WINDOW_SIZE]
             self.audio_buffer = self.audio_buffer[self.WINDOW_SIZE:]
 
-            # 检查音量
-            volume_db = calculate_db(audio_chunk )
+            # VAD 决策路径只计算特征，不修改音频波形；ASR 仍使用原始 audio_chunk
+            audio_features = calculate_audio_features(audio_chunk)
+            volume_db = audio_features["volume_db"]
 
-            # 转换为torch tensor
+            # 诊断：chunk 幅度和自适应门限，用于调试 VAD 决策
+            self._vad_chunk_log_counter += 1
+
+            # ASR 用的原始 tensor，存入 speech_segment_buffer
             audio_tensor = torch.from_numpy(audio_chunk)
 
-            # 使用prob_model计算语音概率
+            # 使用 prob_model 计算语音概率（VAD 路径：不再做逐采样点硬置零）
             bef_vad_ts = time.time()
-            speech_prob = self.prob_model(audio_tensor, self.SAMPLING_RATE).item()
+            speech_prob = self.prob_model(torch.from_numpy(audio_chunk), self.SAMPLING_RATE).item()
             after_vad_ts = time.time()
-            logger.trace(f"VAD 计算时间: {after_vad_ts - bef_vad_ts:.4f}s, 概率: {speech_prob:.4f}, 音量: {volume_db:.3f} dB")
             smoothed_prob = self.get_smooth_values(speech_prob)
 
-            # 状态管理逻辑：同时考虑VAD概率和音量
-            is_vad_hit = smoothed_prob > self.prob_threshold
-            is_volume_sufficient = volume_db >= self.volume_threshold
-            is_hit = is_vad_hit and is_volume_sufficient
+            # 状态管理逻辑：Silero 概率 + 自适应能量门控 + ACTIVE/IDLE 滞回
+            vad_decision = self.decision_gate.decide(self.state, smoothed_prob, audio_features)
+            is_hit = vad_decision["is_hit"]
+            if self._vad_chunk_log_counter % self._vad_chunk_log_interval == 0:
+                logger.info(
+                    f"[vad gate] state={self.state.name} prob={speech_prob:.4f} smooth={smoothed_prob:.4f} "
+                    f"prob_thr={vad_decision['prob_threshold']:.3f} volume={volume_db:.2f}dB "
+                    f"energy_thr={vad_decision['energy_threshold_db']:.2f}dB "
+                    f"noise_floor={vad_decision['noise_floor_db']} "
+                    f"peak={audio_features['peak']:.4f} mean_abs={audio_features['mean_abs']:.4f} "
+                    f"is_hit={is_hit}"
+                )
+            logger.trace(f"VAD 计算时间: {after_vad_ts - bef_vad_ts:.4f}s, 概率: {speech_prob:.4f}, 音量: {volume_db:.3f} dB")
             logger.trace(f'is_hit: {is_hit}')
             logger.trace(f'hit_count: {self.hit_count}')
             logger.trace(f'miss_count: {self.miss_count}')
@@ -348,12 +473,18 @@ async def websocket_endpoint(websocket: WebSocket):
     vad_processor = VADProcessor(
         smoothing_window=config.smoothing_window,
         prob_threshold=config.prob_threshold,
+        exit_prob_threshold=config.exit_prob_threshold,
         required_hits=config.required_hits,
         required_misses=config.required_misses,
         prebuffer=config.prebuffer,
         lang=config.lang,
         volume_threshold=config.volume_threshold,
+        snr_margin_db=config.snr_margin_db,
+        active_snr_margin_db=config.active_snr_margin_db,
+        noise_floor_window=config.noise_floor_window,
+        noise_update_prob_threshold=config.noise_update_prob_threshold,
         asr_url=config.asr_url,
+        vad_silence_threshold=config.vad_silence_threshold,
         enable_speaker_verification=config.enable_speaker_verification,
         )
     logger.info("WebSocket connection established with dedicated VAD processor")
@@ -429,19 +560,31 @@ if __name__ == "__main__":
                         help='日志文件日志级别（STDOUT不受影响）')
     parser.add_argument('--uvicorn-log-level', default='info')
     parser.add_argument('--prob-threshold', type=float, default=0.4,  # 旧值: 0.8
-                        help='移动平均概率阈值，只有大于此值才返回结果')
+                        help='IDLE 状态进入 ACTIVE 的移动平均概率阈值')
+    parser.add_argument('--exit-prob-threshold', type=float, default=0.25,
+                        help='ACTIVE 状态维持语音段的移动平均概率阈值，低于进入阈值以保留尾音')
     parser.add_argument('--smoothing-window', type=int, default=1,
                         help='移动平均窗口大小')
     parser.add_argument('--required-hits', type=int, default=3,  # 旧值: 5
                         help='从IDLE进入ACTIVE状态需要的连续命中次数')
-    parser.add_argument('--required-misses', type=int, default=16,
+    parser.add_argument('--required-misses', type=int, default=32,  # 16
                         help='从ACTIVE进入IDLE状态需要的连续未命中次数')
-    parser.add_argument('--prebuffer', type=int, default=12,  # 旧值: 10
+    parser.add_argument('--prebuffer', type=int, default=16,  # 旧值: 12
                         help='从IDLE转换到ACTIVE时包含的之前音频块数量')
     parser.add_argument('--lang', type=str, default='auto',
                         help='ASR语言')
     parser.add_argument('--volume-threshold', type=float, default=-50.0,  # 旧值: -35
-                        help='音量门限值（分贝），低于此值的音频将被忽略')
+                        help='最低音量门限值（分贝），自适应噪声门限不会低于此值')
+    parser.add_argument('--snr-margin-db', type=float, default=10.0,
+                        help='IDLE 状态下，进入语音段需要高于自适应噪声底的分贝数')
+    parser.add_argument('--active-snr-margin-db', type=float, default=0.0,
+                        help='ACTIVE 状态下，维持语音段需要高于自适应噪声底的分贝数，可低于进入门限以保留尾音')
+    parser.add_argument('--noise-floor-window', type=int, default=80,
+                        help='估计自适应噪声底使用的最近静音 chunk 数')
+    parser.add_argument('--noise-update-prob-threshold', type=float, default=0.2,
+                        help='仅当平滑 VAD 概率低于该值时，才用当前 chunk 更新噪声底')
+    parser.add_argument('--vad-silence-threshold', type=float, default=0.05,
+                        help='兼容旧参数；当前版本不再用它做逐采样点硬置零')
     parser.add_argument('--enable_speaker_verification', action='store_true',
                         help='启用声纹识别功能')
     parser.add_argument('--asr-url', type=str, required=True,
@@ -450,20 +593,29 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     assert args.prebuffer + args.required_hits <= args.required_misses
+    assert args.noise_floor_window > 0
+    assert args.exit_prob_threshold <= args.prob_threshold
+    assert args.active_snr_margin_db <= args.snr_margin_db
 
     # 配置 loguru 日志 - 最简单配置：控制台 + 文件
     logger.add("vad_server.log", level=args.log_level)
 
     # 设置全局配置
     config.prob_threshold = args.prob_threshold
+    config.exit_prob_threshold = args.exit_prob_threshold
     config.smoothing_window = args.smoothing_window
     config.required_hits = args.required_hits
     config.required_misses = args.required_misses
     config.prebuffer = args.prebuffer
     config.lang = args.lang
     config.volume_threshold = args.volume_threshold
+    config.snr_margin_db = args.snr_margin_db
+    config.active_snr_margin_db = args.active_snr_margin_db
+    config.noise_floor_window = args.noise_floor_window
+    config.noise_update_prob_threshold = args.noise_update_prob_threshold
     config.enable_speaker_verification = args.enable_speaker_verification
     config.asr_url = args.asr_url.rstrip("/")
+    config.vad_silence_threshold = args.vad_silence_threshold
 
     # 直接输出服务器信息
     server_info = get_server_info()
