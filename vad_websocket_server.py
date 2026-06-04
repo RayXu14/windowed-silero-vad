@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import io
 from collections import deque
@@ -625,71 +626,140 @@ async def root():
     return get_server_info()
 
 
+# 允许 session.init 按连接覆盖的参数白名单（= AppConfig 字段，排除部署级 asr_url）
+_OVERRIDABLE_FIELDS = (
+    'prob_threshold', 'exit_prob_threshold', 'smoothing_window', 'smoothing_method',
+    'required_hits', 'required_misses', 'prebuffer', 'lang',
+    'volume_threshold', 'snr_margin_db', 'active_snr_margin_db',
+    'noise_floor_window', 'noise_update_prob_threshold', 'vad_silence_threshold',
+    'enable_speaker_verification',
+    'enable_early_onset', 'early_onset_floor', 'early_onset_release', 'early_onset_max_lookback',
+    'enable_tail_extend', 'tail_floor', 'tail_release', 'tail_max_lookahead',
+)
+
+
+def _base_params_from_config():
+    """全局默认参数快照，作为每连接配置的基线。"""
+    return {f: getattr(config, f) for f in _OVERRIDABLE_FIELDS}
+
+
+def _validate_params(p):
+    """逐条复用启动期约束校验一份完整参数 dict；不满足抛 ValueError(中文原因)。"""
+    if p['prebuffer'] + p['required_hits'] > p['required_misses']:
+        raise ValueError("prebuffer + required_hits 必须 <= required_misses")
+    if not p['noise_floor_window'] > 0:
+        raise ValueError("noise_floor_window 必须 > 0")
+    if p['exit_prob_threshold'] > p['prob_threshold']:
+        raise ValueError("exit_prob_threshold 必须 <= prob_threshold")
+    if p['active_snr_margin_db'] > p['snr_margin_db']:
+        raise ValueError("active_snr_margin_db 必须 <= snr_margin_db")
+    if p['early_onset_release'] < 1:
+        raise ValueError("early_onset_release 必须 >= 1")
+    if p['early_onset_max_lookback'] < 0:
+        raise ValueError("early_onset_max_lookback 必须 >= 0")
+    if p['tail_release'] < 1:
+        raise ValueError("tail_release 必须 >= 1")
+    if not (p['tail_max_lookahead'] is None or p['tail_max_lookahead'] >= 0):
+        raise ValueError("tail_max_lookahead 必须 >= 0 或省略")
+
+
+def _merge_init_config(overrides):
+    """把 session.init 的 config 覆盖到全局默认上，返回完整参数 dict。
+    未知字段 / 类型不匹配 / 约束不过 → 抛 ValueError(供调用方回错关连接)。"""
+    if not isinstance(overrides, dict):
+        raise ValueError("config 必须是对象")
+    unknown = set(overrides) - set(_OVERRIDABLE_FIELDS)
+    if unknown:
+        raise ValueError(f"未知配置字段: {sorted(unknown)}")
+
+    base = _base_params_from_config()
+    for k, v in overrides.items():
+        if k == 'tail_max_lookahead' and v is None:
+            base[k] = None
+            continue
+        ref = base[k]
+        # 按基线值的类型做轻校验：bool/数值/字符串各自匹配，类型不符直接拒绝
+        if isinstance(ref, bool):
+            if not isinstance(v, bool):
+                raise ValueError(f"{k} 应为布尔值")
+        elif isinstance(ref, str):
+            if not isinstance(v, str):
+                raise ValueError(f"{k} 应为字符串")
+        elif isinstance(ref, (int, float)) or ref is None:
+            # 数值字段(部分默认为 None,如 tail_max_lookahead)：接受 int/float，拒绝 bool
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise ValueError(f"{k} 应为数值")
+        base[k] = v
+
+    _validate_params(base)
+    return base
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket connection accepted - NEW VERSION")
 
-    # 为每个连接创建独立的 VAD 处理器，使用配置的参数
-    logger.info(f"Creating VAD processor for new connection...")
-    vad_processor = VADProcessor(
-        smoothing_window=config.smoothing_window,
-        smoothing_method=config.smoothing_method,
-        prob_threshold=config.prob_threshold,
-        exit_prob_threshold=config.exit_prob_threshold,
-        required_hits=config.required_hits,
-        required_misses=config.required_misses,
-        prebuffer=config.prebuffer,
-        lang=config.lang,
-        volume_threshold=config.volume_threshold,
-        snr_margin_db=config.snr_margin_db,
-        active_snr_margin_db=config.active_snr_margin_db,
-        noise_floor_window=config.noise_floor_window,
-        noise_update_prob_threshold=config.noise_update_prob_threshold,
-        asr_url=config.asr_url,
-        vad_silence_threshold=config.vad_silence_threshold,
-        enable_speaker_verification=config.enable_speaker_verification,
-        enable_early_onset=config.enable_early_onset,
-        early_onset_floor=config.early_onset_floor,
-        early_onset_release=config.early_onset_release,
-        early_onset_max_lookback=config.early_onset_max_lookback,
-        enable_tail_extend=config.enable_tail_extend,
-        tail_floor=config.tail_floor,
-        tail_release=config.tail_release,
-        tail_max_lookahead=config.tail_max_lookahead,
-        )
+    # 等首帧最多 1 秒以区分新/老客户端：
+    #   session.init → 用其 config 覆盖默认；audio_chunk → 用默认并补处理这帧；
+    #   超时(老客户端在等 ready) → 用默认。
+    try:
+        first = await asyncio.wait_for(websocket.receive_json(), timeout=1.0)
+    except asyncio.TimeoutError:
+        first = None
+    except WebSocketDisconnect:
+        logger.info("WebSocket connection closed before first message")
+        return
+
+    pending_audio = None  # 首帧若是 audio_chunk，建好 processor 后再处理
+    if first is not None and first.get("type") == "session.init":
+        try:
+            params = _merge_init_config(first.get("config") or {})
+        except ValueError as e:
+            logger.info(f"session.init 配置无效，关闭连接: {e}")
+            await websocket.send_json({"type": "error", "error": f"session.init 配置无效: {e}"})
+            await websocket.close()
+            return
+        logger.info("session.init 已应用按连接配置")
+    else:
+        params = _base_params_from_config()
+        if first is not None and first.get("type") == "audio_chunk":
+            pending_audio = first
+
+    # 为该连接创建独立 VAD 处理器（参数 = 默认或 session.init 覆盖后）
+    logger.info("Creating VAD processor for new connection...")
+    vad_processor = VADProcessor(asr_url=config.asr_url, **params)
     logger.info("WebSocket connection established with dedicated VAD processor")
 
-    # 发送就绪状态
-    logger.info("Sending ready status...")
+    # 就绪状态：带回本连接实际生效的全部参数，供客户端核对
     await websocket.send_json({
         "type": "status",
         "status": "ready",
-        "message": "VAD 和 ASR 模型加载完成，可以开始发送音频数据"
+        "message": "VAD 和 ASR 模型加载完成，可以开始发送音频数据",
+        "effective_config": params,
         })
     logger.info("Ready status sent")
 
+    async def handle_audio(message, received_ts):
+        audio_data = message.get("data")
+        timestamp = message.get("timestamp")
+        if audio_data is None:
+            return
+        for result in vad_processor.process_audio_chunk(audio_data, timestamp, received_ts):
+            await websocket.send_json(result)
+
     try:
+        # 先补处理首帧 audio_chunk（若有）
+        if pending_audio is not None:
+            await handle_audio(pending_audio, time.time())
+
         while True:
             message = await websocket.receive_json()
             received_ts = time.time()
             logger.trace(f"Received")
 
             if message.get("type") == "audio_chunk":
-                # 获取音频数据和时间戳
-                audio_data = message.get("data")
-                timestamp = message.get("timestamp")
-
-                if audio_data is None:
-                    continue
-
-                # 使用VAD处理器处理音频数据
-                vad_results = vad_processor.process_audio_chunk(audio_data, timestamp, received_ts)
-
-                # 发送所有VAD结果
-                for result in vad_results:
-                    await websocket.send_json(result)
-
+                await handle_audio(message, received_ts)
             else:
                 # 对不支持的消息类型发送错误回应
                 await websocket.send_json({

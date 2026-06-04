@@ -2,7 +2,7 @@
 
 基于 Silero VAD 的流式语音端点检测 WebSocket 服务，检测到完整语音段后切片送 ASR 转写。
 
-本分支是线上原版 windowed-silero-vad 的**增强版**：**WebSocket 协议、输入/输出格式与线上完全兼容**，接入方无需任何改动。在原版滑窗均值平滑的基础上增加三项增强，目标是降低误触发、找回被切掉的首尾音频：
+本分支是线上原版 windowed-silero-vad 的**增强版**：原有 `audio_chunk` 上行 + `vad`/`asr` 下行协议**完全保留**，不发握手的老客户端无需任何改动。新增**可选**的 `session.init` 握手（见下方「按连接配置」），让每条连接能传入自己的 VAD 参数。在原版滑窗均值平滑的基础上增加三项增强，目标是降低误触发、找回被切掉的首尾音频：
 
 - **EMA 概率平滑**：指数平滑替代滑窗均值，抑制概率抖动导致的误触发。
 - **early-onset 起点回溯**：状态机确认进入语音后，用原始(未平滑)概率向前回溯，把被平滑/阈值切掉的前导字补回语音段。
@@ -63,7 +63,34 @@ uv run vad_websocket_server.py --asr-url http://localhost:50300 --port 50162 \
 ```bash
 uv run test_realtime_client.py            # 实时麦克风
 uv run test_client.py /path/to/wav/dir    # 离线 WAV 目录
+uv run test_ws_init.py                    # session.init 握手协议四路
 ```
+
+## 按连接配置（session.init）
+
+每条 WS 连接各自持有一个独立的 VAD 处理器。默认所有连接用服务启动时的全局参数；客户端可在**连接后的首帧**发一条 `session.init` 覆盖本连接的 VAD 参数，互不影响。
+
+**上行 `session.init`**（首帧，可选）：
+
+```json
+{ "type": "session.init", "config": { "prob_threshold": 0.6, "enable_early_onset": true } }
+```
+
+- `config` 里只放想覆盖的字段，未给的字段取全局默认。可覆盖字段 = 下方「关键参数」表中的全部 VAD 调优项（`asr-url`、端口等部署级参数不开放）。
+- 字段名用**下划线**形式（如 `prob_threshold`、`enable_tail_extend`），与命令行的连字符形式对应。
+
+**下行 `ready`**：服务端建好处理器后回 `ready`，并带回本连接**实际生效**的全部参数供核对：
+
+```json
+{ "type": "status", "status": "ready", "message": "...", "effective_config": { ... } }
+```
+
+**错误处理**：`config` 含未知字段、类型不符、或违反约束（如 `exit_prob_threshold > prob_threshold`、`prebuffer + required_hits > required_misses`）时，回 `{ "type": "error", "error": "session.init 配置无效: ..." }` 并**关闭连接**。
+
+**兼容性**：`session.init` 可选。
+
+- 不发 init、首帧直接是 `audio_chunk` → 用全局默认建处理器，正常工作。
+- 老客户端连上后等 `ready` 才发音频 → 服务端等首帧最多 1 秒，超时即用全局默认建处理器并发 `ready`（老客户端零改动）。
 
 ## 关键参数
 

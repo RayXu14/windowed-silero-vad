@@ -28,19 +28,23 @@ BLOCK_SIZE = 320
 
 class RealtimeVADClient:
 
-    def __init__(self, uri: str):
+    def __init__(self, uri: str, init_config: dict = None):
         self.uri = uri
+        # 每连接配置：发 session.init 携带；None 时发空 {} 用服务端全局默认（顺带省掉服务端 1s 兜底等待）
+        self.init_config = init_config or {}
         self.audio_queue: asyncio.Queue = asyncio.Queue()
         self.running = True
 
     async def run(self):
         print(f"连接到 {self.uri} ...")
         async with websockets.connect(self.uri) as ws:
-            # 等待 ready
+            # 首帧发 session.init（可选覆盖本连接 VAD 参数），再等 ready
+            await ws.send(json.dumps({"type": "session.init", "config": self.init_config}))
             ready_msg = json.loads(await ws.recv())
             if ready_msg.get("status") != "ready":
-                raise RuntimeError(f"服务器未就绪: {ready_msg}")
+                raise RuntimeError(f"服务器未就绪/初始化失败: {ready_msg}")
             print(f"服务器就绪: {ready_msg.get('message')}")
+            print(f"生效配置: {json.dumps(ready_msg.get('effective_config', {}), ensure_ascii=False)}")
             print("开始录音，请说话... (Ctrl+C 退出)\n")
 
             # 启动麦克风采集（在音频回调线程中写入 queue）
@@ -118,9 +122,13 @@ class RealtimeVADClient:
 def main():
     parser = argparse.ArgumentParser(description="实时麦克风 VAD+ASR 测试客户端")
     parser.add_argument("--uri", default="ws://localhost:50160/ws", help="VAD WebSocket 服务地址")
+    parser.add_argument("--init-config", default=None,
+                        help='session.init 的 config(JSON)，覆盖本连接 VAD 参数，'
+                             '如 \'{"prob_threshold":0.6,"enable_early_onset":true}\'；不传则用服务端默认')
     args = parser.parse_args()
 
-    client = RealtimeVADClient(args.uri)
+    init_config = json.loads(args.init_config) if args.init_config else None
+    client = RealtimeVADClient(args.uri, init_config=init_config)
     try:
         asyncio.run(client.run())
     except KeyboardInterrupt:

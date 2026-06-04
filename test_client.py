@@ -11,24 +11,29 @@ from scipy.io import wavfile
 class SimpleVADClient:
     """简化的VAD WebSocket客户端"""
     
-    def __init__(self, uri="ws://localhost:8000/ws"):
+    def __init__(self, uri="ws://localhost:8000/ws", init_config=None):
         self.uri = uri
+        # 每连接配置：发 session.init 携带；None 时发空 {} 用服务端全局默认
+        self.init_config = init_config or {}
         self.websocket = None
         self.server_ready = False
         self.server_ready_event = asyncio.Event()
         self.last_message_time = None
         self.receive_task = None
-    
+
     async def connect(self):
-        """连接WebSocket并等待服务器就绪"""
+        """连接WebSocket，发送 session.init，并等待服务器就绪"""
         print("连接到服务器...")
         self.websocket = await websockets.connect(self.uri)
         print("WebSocket连接已建立")
-        
+
         # 启动接收循环
         self.receive_task = asyncio.create_task(self._receive_loop())
         print("接收循环已启动")
-        
+
+        # 首帧发 session.init（可选覆盖本连接 VAD 参数），再等 ready
+        await self.websocket.send(json.dumps({"type": "session.init", "config": self.init_config}))
+
         # 等待服务器就绪
         print("等待服务器加载VAD模型...")
         await self.server_ready_event.wait()
@@ -51,7 +56,8 @@ class SimpleVADClient:
                         print(f"服务器状态: {status} - {message_text}")
                         
                         if status == "ready":
-                            print("设置服务器就绪状态")
+                            ec = result.get("effective_config", {})
+                            print(f"设置服务器就绪状态; 生效配置: {json.dumps(ec, ensure_ascii=False)}")
                             self.server_ready = True
                             self.server_ready_event.set()
                             
@@ -134,9 +140,9 @@ async def send_audio_chunks(client, combined_wav, chunk_size, send_start_time):
     print(f'发送完成，共{chunk_count}块（包含100块空音频），发送耗时: {(send_done_time - send_start_time):.2f} 秒')
     return send_done_time
 
-async def get_vad_results(wav_path, chunk_size=512):
+async def get_vad_results(wav_path, chunk_size=512, uri="ws://localhost:8000/ws", init_config=None):
     """获取音频文件的VAD结果列表"""
-    client = SimpleVADClient()
+    client = SimpleVADClient(uri=uri, init_config=init_config)
     
     try:
         await client.connect()
@@ -203,7 +209,10 @@ if __name__ == "__main__":
     parser.add_argument("wav_path", help="包含 WAV 文件的目录路径")
     parser.add_argument("--chunk-size", type=int, default=320, help="音频块大小（采样点数）")
     parser.add_argument("--uri", default="ws://localhost:8000/ws", help="VAD WebSocket 服务地址")
+    parser.add_argument("--init-config", default=None,
+                        help='session.init 的 config(JSON)，覆盖本连接 VAD 参数；不传则用服务端默认')
     args = parser.parse_args()
+    init_config = json.loads(args.init_config) if args.init_config else None
 
     if not os.path.isdir(args.wav_path):
         print(f"错误: 目录不存在: {args.wav_path}", file=sys.stderr)
@@ -217,7 +226,8 @@ if __name__ == "__main__":
     print("注意: 需要先启动 ASR 服务和 VAD WebSocket 服务")
     start_time = time.time()
     
-    asyncio.run(get_vad_results(args.wav_path, chunk_size=args.chunk_size))
+    asyncio.run(get_vad_results(args.wav_path, chunk_size=args.chunk_size,
+                                uri=args.uri, init_config=init_config))
     
     end_time = time.time()
     total_time = end_time - start_time
