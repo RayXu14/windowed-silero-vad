@@ -23,6 +23,7 @@ class AppConfig:
     prob_threshold = None
     exit_prob_threshold = None
     smoothing_window = None
+    smoothing_method = None
     required_hits = None
     required_misses = None
     prebuffer = None
@@ -35,6 +36,16 @@ class AppConfig:
     enable_speaker_verification = None
     asr_url = None
     vad_silence_threshold = None
+    # early-onset 辅助回溯：用原始(未平滑)概率把语音段左边界往前精修
+    enable_early_onset = None
+    early_onset_floor = None
+    early_onset_release = None
+    early_onset_max_lookback = None
+    # tail-extend 段尾延伸：用原始概率把语音段右边界往后延伸，找回被切掉的尾音(镜像 early-onset)
+    enable_tail_extend = None
+    tail_floor = None
+    tail_release = None
+    tail_max_lookahead = None
 
 
 config = AppConfig()
@@ -155,6 +166,15 @@ class VADProcessor:
         asr_url: str,
         vad_silence_threshold: float,
         enable_speaker_verification: bool = False,
+        smoothing_method: str = "mean",
+        enable_early_onset: bool = False,
+        early_onset_floor: float = 0.35,
+        early_onset_release: int = 2,
+        early_onset_max_lookback: int = 16,
+        enable_tail_extend: bool = False,
+        tail_floor: float = 0.15,
+        tail_release: int = 2,
+        tail_max_lookahead: int = None,
     ):
         # 加载VAD模型
         self.prob_model = load_silero_vad(onnx=True)
@@ -170,6 +190,8 @@ class VADProcessor:
 
         # 移动平均窗口和阈值
         self.prob_window = deque(maxlen=smoothing_window)
+        self.smoothing_method = smoothing_method
+        self._ema_prob = None
         self.prob_threshold = prob_threshold
 
         # VAD 命中决策：进入语音段时门槛更高，语音段内门槛更宽松
@@ -193,6 +215,31 @@ class VADProcessor:
         # 预缓冲参数和循环缓冲区
         self.prebuffer = prebuffer
         self.prebuffer_queue = deque(maxlen=required_hits + prebuffer)
+
+        # early-onset 辅助回溯：独立历史环形缓冲，存原始概率以便事后往回找真正起点。
+        # 与 prebuffer_queue/状态机解耦；长度比基线起点多 max_lookback 帧，用于"额外往前"回溯。
+        self.enable_early_onset = enable_early_onset
+        self.early_onset_floor = early_onset_floor
+        self.early_onset_release = early_onset_release
+        self.early_onset_max_lookback = early_onset_max_lookback
+        self.history_buffer = deque(
+            maxlen=required_hits + prebuffer + early_onset_max_lookback
+        )
+        # watermark：上一段已送 ASR 的音频在 history 里的右端绝对序号，回溯不得越过它
+        self.global_chunk_index = 0
+        self.last_segment_end_index = -1
+
+        # tail-extend 段尾延伸：ACTIVE-miss 的 chunk 存入此独立缓冲(含原始概率)，
+        # 段结束时从最后命中往后做前向延伸，找回被切掉的尾音。最长 required_misses 个。
+        self.enable_tail_extend = enable_tail_extend
+        self.tail_floor = tail_floor
+        self.tail_release = tail_release
+        # 上限默认 = required_misses，且强制不超过它(tail_buffer 也只装这么多)
+        self.tail_max_lookahead = min(
+            tail_max_lookahead if tail_max_lookahead is not None else required_misses,
+            required_misses,
+        )
+        self.tail_buffer = deque(maxlen=required_misses)
 
         # 状态转换计数器
         self.hit_count = 0
@@ -219,6 +266,11 @@ class VADProcessor:
 
     def get_smooth_values(self, prob):
         self.prob_window.append(prob)
+        if getattr(self, "smoothing_method", "mean") == "ema":
+            win = max(1, self.prob_window.maxlen or 1)
+            alpha = 2.0 / (win + 1.0)
+            self._ema_prob = float(prob) if self._ema_prob is None else alpha * float(prob) + (1.0 - alpha) * self._ema_prob
+            return self._ema_prob
         smoothed_prob = np.mean(self.prob_window)
         return smoothed_prob
 
@@ -298,7 +350,75 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
             logger.opt(exception=True).error("Failed to save speech segment")
             return None, None, None
         finally:
+            # 段已送 ASR：推进 watermark 到本段最后一个 chunk，回溯不得越过它取已用音频
+            if self.enable_early_onset and self.speech_segment_buffer:
+                self.last_segment_end_index = self.speech_segment_buffer[-1]['index']
             self.speech_segment_buffer.clear()
+
+    def _collect_early_onset_prefix(self, baseline_start_index):
+        """基线确认 ACTIVE 后，用原始概率从基线起点往左回溯，返回应前置到语音段的更早 chunk 列表。
+
+        只扩不缩：回溯起点 <= baseline_start_index；遇连续 release 帧低于 floor、
+        越过 max_lookback、或触及上一段 watermark 即停。返回按时间正序的 chunk 列表（可能为空）。
+        """
+        # history 里 index >= baseline_start_index 的部分由 prebuffer_queue 负责，这里只看更早的
+        earlier = [c for c in self.history_buffer if c['index'] < baseline_start_index]
+        if not earlier:
+            return []
+
+        # 从近到远扫描：用 release 容忍语音内部的短低谷，跨过它继续往前；
+        # 连续 release 帧低于地板则认定到了段开头。onset_pos 记录"最后一个 >=floor 的位置"，
+        # 即真正起点——prefix 一定截止到它，末尾不留任何低于地板帧。
+        reversed_earlier = list(reversed(earlier))
+        silent = 0
+        onset_pos = -1  # earlier 倒序列表里的下标；-1 表示没找到任何语音帧
+        for pos, chunk in enumerate(reversed_earlier):
+            if pos >= self.early_onset_max_lookback:
+                break
+            if chunk['index'] <= self.last_segment_end_index:
+                break  # 硬左界：不越过上一段已送 ASR 的音频
+            if chunk['prob_raw'] >= self.early_onset_floor:
+                onset_pos = pos
+                silent = 0
+            else:
+                silent += 1
+                if silent >= self.early_onset_release:
+                    break
+
+        if onset_pos < 0:
+            return []
+        # 取 [0, onset_pos] 这段（倒序），反转成时间正序前置到语音段
+        prefix = reversed_earlier[:onset_pos + 1]
+        prefix.reverse()
+        return prefix
+
+    def _collect_tail_extension(self):
+        """段结束时，用原始概率从最后命中往后延伸，返回应追加到语音段尾的尾音 chunk 列表。
+
+        镜像 _collect_early_onset_prefix：tail_buffer 按时间正序存了最后命中之后的 miss chunk。
+        从头往后扫，prob_raw>=floor 记为尾音终点；连续 release 帧低于 floor、或越过
+        max_lookahead 即停。返回 [开头, 尾音终点] 这段(时间正序，可能为空)，末尾静音不收。
+        """
+        if not self.tail_buffer:
+            return []
+
+        silent = 0
+        end_pos = -1  # tail_buffer 里最后一个 >=floor 的位置；-1 表示无尾音，不延伸
+        for pos, chunk in enumerate(self.tail_buffer):
+            if pos >= self.tail_max_lookahead:
+                break
+            if chunk['prob_raw'] >= self.tail_floor:
+                end_pos = pos
+                silent = 0
+            else:
+                silent += 1
+                if silent >= self.tail_release:
+                    break
+
+        if end_pos < 0:
+            return []
+        # 取 [0, end_pos] 这段(已是时间正序)，追加到语音段尾，末尾低于地板帧不收
+        return list(self.tail_buffer)[:end_pos + 1]
 
     def process_audio_chunk(self, audio_data, timestamp, received_ts):
         """
@@ -368,10 +488,17 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
                 "timestamp": timestamp,  # 比较粗糙的时间戳
                 "received_ts": received_ts,
                 'bef_process_ts': bef_process_ts,
+                'prob_raw': speech_prob,           # 未平滑概率，供 early-onset 回溯
+                'index': self.global_chunk_index,  # 全局递增序号，做回溯左界判定
             }
+            self.global_chunk_index += 1
 
             # 将当前音频块添加到预缓冲循环队列中（无论是否hit都要保存）
             self.prebuffer_queue.append(current_chunk)
+
+            # early-onset：维护更长的历史环形缓冲（含原始概率），供基线确认后回溯精修起点
+            if self.enable_early_onset:
+                self.history_buffer.append(current_chunk)
 
             if is_hit:
                 self.hit_count += 1
@@ -385,12 +512,25 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
                         self.state = State.ACTIVE
 
                         # 获取语音段开始时间戳（使用第一个命中的音频块时间戳）
+                        # 注意：timestamp 暂不随 early-onset 前移，维持基线起点（见 TODO）
                         speech_start_timestamp = self.prebuffer_queue[-self.hit_count]['timestamp']
 
                         yield {
                             "type": "vad",
                             'timestamp': speech_start_timestamp
                             }
+
+                        # early-onset：基线起点 = prebuffer_queue 最左 chunk 的全局序号，
+                        # 在倒入 prebuffer 之前，先把回溯到的更早 chunk 前置进语音段
+                        if self.enable_early_onset and self.prebuffer_queue:
+                            baseline_start_index = self.prebuffer_queue[0]['index']
+                            prefix = self._collect_early_onset_prefix(baseline_start_index)
+                            if prefix:
+                                self.speech_segment_buffer.extend(prefix)
+                                logger.info(
+                                    f"[early-onset] 起点前移 {len(prefix)} 帧 "
+                                    f"({len(prefix) * VADProcessor.WINDOW_SIZE / VADProcessor.SAMPLING_RATE * 1000:.0f}ms)"
+                                )
 
                         while self.prebuffer_queue:
                             self.speech_segment_buffer.append(self.prebuffer_queue.popleft())
@@ -405,6 +545,11 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
 
                     while self.prebuffer_queue:
                         self.speech_segment_buffer.append(self.prebuffer_queue.popleft())
+
+                    # tail-extend：重新命中→刚才那批 miss 是句内停顿(已随 prebuffer 进段)，
+                    # 不是段尾，tail_buffer 作废重来
+                    if self.enable_tail_extend:
+                        self.tail_buffer.clear()
 
             else:
                 self.miss_count += 1
@@ -421,9 +566,26 @@ transcribe到处理完毕: {all_done_ts - bef_transcrib_ts:.3f}s
                         "type": "vad",
                         'timestamp': current_chunk['timestamp']
                         }
+
+                    # tail-extend：ACTIVE-miss 的 chunk 存入尾部缓冲，供段结束时前向延伸找回尾音
+                    if self.enable_tail_extend:
+                        self.tail_buffer.append(current_chunk)
+
                     # 检查是否达到转换条件
                     if self.miss_count >= self.required_misses:
                         self.state = State.IDLE
+
+                        # tail-extend：送 ASR 前，把尾部 miss 里仍属于尾音的 chunk 追加进语音段
+                        if self.enable_tail_extend:
+                            extension = self._collect_tail_extension()
+                            if extension:
+                                self.speech_segment_buffer.extend(extension)
+                                logger.info(
+                                    f"[tail-extend] 段尾延伸 {len(extension)} 帧 "
+                                    f"({len(extension) * VADProcessor.WINDOW_SIZE / VADProcessor.SAMPLING_RATE * 1000:.0f}ms)"
+                                )
+                            self.tail_buffer.clear()
+
                         # 保存完整的语音段
                         asr_result, asr_timestamp, speaker_id = self.transcrib_and_save_speech_segment()
                         if asr_result is None:
@@ -472,6 +634,7 @@ async def websocket_endpoint(websocket: WebSocket):
     logger.info(f"Creating VAD processor for new connection...")
     vad_processor = VADProcessor(
         smoothing_window=config.smoothing_window,
+        smoothing_method=config.smoothing_method,
         prob_threshold=config.prob_threshold,
         exit_prob_threshold=config.exit_prob_threshold,
         required_hits=config.required_hits,
@@ -486,6 +649,14 @@ async def websocket_endpoint(websocket: WebSocket):
         asr_url=config.asr_url,
         vad_silence_threshold=config.vad_silence_threshold,
         enable_speaker_verification=config.enable_speaker_verification,
+        enable_early_onset=config.enable_early_onset,
+        early_onset_floor=config.early_onset_floor,
+        early_onset_release=config.early_onset_release,
+        early_onset_max_lookback=config.early_onset_max_lookback,
+        enable_tail_extend=config.enable_tail_extend,
+        tail_floor=config.tail_floor,
+        tail_release=config.tail_release,
+        tail_max_lookahead=config.tail_max_lookahead,
         )
     logger.info("WebSocket connection established with dedicated VAD processor")
 
@@ -559,34 +730,55 @@ if __name__ == "__main__":
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'TRACE'],
                         help='日志文件日志级别（STDOUT不受影响）')
     parser.add_argument('--uvicorn-log-level', default='info')
-    parser.add_argument('--prob-threshold', type=float, default=0.4,  # 旧值: 0.8
+    parser.add_argument('--prob-threshold', type=float, default=0.4,  # 线上默认
                         help='IDLE 状态进入 ACTIVE 的移动平均概率阈值')
     parser.add_argument('--exit-prob-threshold', type=float, default=0.25,
                         help='ACTIVE 状态维持语音段的移动平均概率阈值，低于进入阈值以保留尾音')
-    parser.add_argument('--smoothing-window', type=int, default=1,
-                        help='移动平均窗口大小')
+    parser.add_argument('--smoothing-window', type=int, default=6,  # 线上默认
+                        help='平滑窗口(线上默认win=6)')
+    parser.add_argument('--smoothing-method', type=str, default='ema', choices=['mean', 'ema'],
+                        help='概率平滑:mean=滑窗均值(线上原版)/ema=指数平滑(本服务新增,降误触发)')
     parser.add_argument('--required-hits', type=int, default=3,  # 旧值: 5
                         help='从IDLE进入ACTIVE状态需要的连续命中次数')
-    parser.add_argument('--required-misses', type=int, default=32,  # 16
+    parser.add_argument('--required-misses', type=int, default=20,  # 评测那套(线上32)
                         help='从ACTIVE进入IDLE状态需要的连续未命中次数')
     parser.add_argument('--prebuffer', type=int, default=16,  # 旧值: 12
                         help='从IDLE转换到ACTIVE时包含的之前音频块数量')
     parser.add_argument('--lang', type=str, default='auto',
                         help='ASR语言')
-    parser.add_argument('--volume-threshold', type=float, default=-50.0,  # 旧值: -35
+    parser.add_argument('--volume-threshold', type=float, default=-30.0,  # 评测那套(线上-38/-50)
                         help='最低音量门限值（分贝），自适应噪声门限不会低于此值')
-    parser.add_argument('--snr-margin-db', type=float, default=10.0,
+    parser.add_argument('--snr-margin-db', type=float, default=28.0,  # 评测那套(线上10)
                         help='IDLE 状态下，进入语音段需要高于自适应噪声底的分贝数')
     parser.add_argument('--active-snr-margin-db', type=float, default=0.0,
                         help='ACTIVE 状态下，维持语音段需要高于自适应噪声底的分贝数，可低于进入门限以保留尾音')
-    parser.add_argument('--noise-floor-window', type=int, default=80,
+    parser.add_argument('--noise-floor-window', type=int, default=120,  # 评测那套(线上80)
                         help='估计自适应噪声底使用的最近静音 chunk 数')
-    parser.add_argument('--noise-update-prob-threshold', type=float, default=0.2,
+    parser.add_argument('--noise-update-prob-threshold', type=float, default=0.5,  # 评测那套(线上0.2)
                         help='仅当平滑 VAD 概率低于该值时，才用当前 chunk 更新噪声底')
     parser.add_argument('--vad-silence-threshold', type=float, default=0.05,
                         help='兼容旧参数；当前版本不再用它做逐采样点硬置零')
     parser.add_argument('--enable_speaker_verification', action='store_true',
                         help='启用声纹识别功能')
+    # early-onset 辅助回溯：用原始(未 EMA)概率把语音段左边界往前精修，捞回被切掉的前导字
+    parser.add_argument('--enable-early-onset', action='store_true',
+                        help='启用 early-onset 起点回溯精修（默认关，关闭时行为与现状一致）')
+    parser.add_argument('--early-onset-floor', type=float, default=0.01,  # 线上默认
+                        help='回溯时判定"还在语音里"的原始概率地板（低于基线 prob-threshold）')
+    parser.add_argument('--early-onset-release', type=int, default=10,  # 线上默认
+                        help='连续多少帧原始概率低于地板，才认定退到段开头并停止回溯')
+    parser.add_argument('--early-onset-max-lookback', type=int, default=20,  # 线上默认
+                        help='在基线起点(prebuffer 覆盖)基础上，额外往前回溯的最大帧数')
+    # tail-extend 段尾延伸：用原始概率把语音段右边界往后延伸，找回被切掉的尾音(镜像 early-onset)
+    parser.add_argument('--enable-tail-extend', action='store_true',
+                        help='启用 tail-extend 段尾延伸（默认关，关闭时行为与现状一致）')
+    parser.add_argument('--tail-floor', type=float, default=0.01,  # 线上默认
+                        help='段尾延伸判定"还是尾音"的原始概率地板。需 < exit-prob-threshold(默认0.25)'
+                             '才有发挥空间：>exit 的尾音基线在 ACTIVE 已自己收进段，进 tail_buffer 的都 <exit')
+    parser.add_argument('--tail-release', type=int, default=10,  # 线上默认
+                        help='连续多少帧原始概率低于地板，才认定到段尾并停止延伸')
+    parser.add_argument('--tail-max-lookahead', type=int, default=20,  # 线上默认
+                        help='段尾最多延伸的帧数，默认=required_misses，且不超过它')
     parser.add_argument('--asr-url', type=str, required=True,
                         help='ASR REST API 服务地址，例如 http://localhost:50300')
 
@@ -596,6 +788,10 @@ if __name__ == "__main__":
     assert args.noise_floor_window > 0
     assert args.exit_prob_threshold <= args.prob_threshold
     assert args.active_snr_margin_db <= args.snr_margin_db
+    assert args.early_onset_release >= 1
+    assert args.early_onset_max_lookback >= 0
+    assert args.tail_release >= 1
+    assert args.tail_max_lookahead is None or args.tail_max_lookahead >= 0
 
     # 配置 loguru 日志 - 最简单配置：控制台 + 文件
     logger.add("vad_server.log", level=args.log_level)
@@ -604,6 +800,7 @@ if __name__ == "__main__":
     config.prob_threshold = args.prob_threshold
     config.exit_prob_threshold = args.exit_prob_threshold
     config.smoothing_window = args.smoothing_window
+    config.smoothing_method = args.smoothing_method
     config.required_hits = args.required_hits
     config.required_misses = args.required_misses
     config.prebuffer = args.prebuffer
@@ -616,6 +813,14 @@ if __name__ == "__main__":
     config.enable_speaker_verification = args.enable_speaker_verification
     config.asr_url = args.asr_url.rstrip("/")
     config.vad_silence_threshold = args.vad_silence_threshold
+    config.enable_early_onset = args.enable_early_onset
+    config.early_onset_floor = args.early_onset_floor
+    config.early_onset_release = args.early_onset_release
+    config.early_onset_max_lookback = args.early_onset_max_lookback
+    config.enable_tail_extend = args.enable_tail_extend
+    config.tail_floor = args.tail_floor
+    config.tail_release = args.tail_release
+    config.tail_max_lookahead = args.tail_max_lookahead
 
     # 直接输出服务器信息
     server_info = get_server_info()
