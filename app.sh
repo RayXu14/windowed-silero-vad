@@ -10,7 +10,7 @@ SERVICE_NAME="windowed-silero-vad-ema"  # 服务名称
 RUNTIME_DIR="logs"                  # 运行时文件目录
 PYTHON_CMD="uv run"                 # 用本目录独立venv
 SCRIPT_NAME="vad_websocket_server.py"  # 主脚本文件名
-PORT=${2:-50162}                    # 服务端口
+PORT=${2:-50160}                    # 服务端口
 ASR_URL=${3:-"http://localhost:50300"}  # ASR服务地址
 
 # ---- 概率平滑 ----

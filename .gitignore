@@ -23,3 +23,7 @@ speaker
 /logs/
 
 .DS_Store
+
+# Claude Code 项目说明（仅本地）
+CLAUDE.md
+CLAUDE.local.md
