@@ -713,8 +713,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     pending_audio = None  # 首帧若是 audio_chunk，建好 processor 后再处理
     if first is not None and first.get("type") == "session.init":
+        init_config = first.get("config") or {}
+        logger.info(f"收到 session.init 配置: {init_config}")
         try:
-            params = _merge_init_config(first.get("config") or {})
+            params = _merge_init_config(init_config)
         except ValueError as e:
             logger.info(f"session.init 配置无效，关闭连接: {e}")
             await websocket.send_json({"type": "error", "error": f"session.init 配置无效: {e}"})
