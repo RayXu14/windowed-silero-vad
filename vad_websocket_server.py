@@ -665,15 +665,18 @@ def _validate_params(p):
 
 def _merge_init_config(overrides):
     """把 session.init 的 config 覆盖到全局默认上，返回完整参数 dict。
-    未知字段 / 类型不匹配 / 约束不过 → 抛 ValueError(供调用方回错关连接)。"""
+    未知字段 → 日志告知后忽略(允许上游透传非 VAD 字段，如 asr_hotwords);
+    类型不匹配 / 约束不过 → 抛 ValueError(供调用方回错关连接)。"""
     if not isinstance(overrides, dict):
         raise ValueError("config 必须是对象")
     unknown = set(overrides) - set(_OVERRIDABLE_FIELDS)
     if unknown:
-        raise ValueError(f"未知配置字段: {sorted(unknown)}")
+        logger.info(f"session.init 含非 VAD 字段，已忽略: {sorted(unknown)}")
 
     base = _base_params_from_config()
     for k, v in overrides.items():
+        if k not in _OVERRIDABLE_FIELDS:
+            continue
         if k == 'tail_max_lookahead' and v is None:
             base[k] = None
             continue
