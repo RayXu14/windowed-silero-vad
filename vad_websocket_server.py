@@ -176,11 +176,13 @@ class VADProcessor:
         tail_floor: float = 0.15,
         tail_release: int = 2,
         tail_max_lookahead: int = None,
+        asr_hotwords: list = None,
     ):
         # 加载VAD模型
         self.prob_model = load_silero_vad(onnx=True)
         self.lang = lang
         self.asr_url = asr_url
+        self.asr_hotwords = list(asr_hotwords) if asr_hotwords else []
         self.http_client = httpx.Client(timeout=30.0)
 
         # 加载初始状态
@@ -295,6 +297,7 @@ class VADProcessor:
                 "audio_base64": audio_b64,
                 "format": "wav",
                 "language": lang,
+                "terms": self.asr_hotwords,
             },
         )
         response.raise_for_status()
@@ -718,6 +721,8 @@ async def websocket_endpoint(websocket: WebSocket):
     if first is not None and first.get("type") == "session.init":
         init_config = first.get("config") or {}
         logger.info(f"收到 session.init 配置: {init_config}")
+        # asr_hotwords 是会话级、无全局默认,不走 VAD 白名单
+        asr_hotwords = init_config.pop("asr_hotwords", None)
         try:
             params = _merge_init_config(init_config)
         except ValueError as e:
@@ -728,12 +733,13 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("session.init 已应用按连接配置")
     else:
         params = _base_params_from_config()
+        asr_hotwords = None
         if first is not None and first.get("type") == "audio_chunk":
             pending_audio = first
 
     # 为该连接创建独立 VAD 处理器（参数 = 默认或 session.init 覆盖后）
     logger.info("Creating VAD processor for new connection...")
-    vad_processor = VADProcessor(asr_url=config.asr_url, **params)
+    vad_processor = VADProcessor(asr_url=config.asr_url, asr_hotwords=asr_hotwords, **params)
     logger.info("WebSocket connection established with dedicated VAD processor")
 
     # 就绪状态：带回本连接实际生效的全部参数，供客户端核对
@@ -741,7 +747,7 @@ async def websocket_endpoint(websocket: WebSocket):
         "type": "status",
         "status": "ready",
         "message": "VAD 和 ASR 模型加载完成，可以开始发送音频数据",
-        "effective_config": params,
+        "effective_config": {**params, "asr_hotwords": vad_processor.asr_hotwords},
         })
     logger.info("Ready status sent")
 
