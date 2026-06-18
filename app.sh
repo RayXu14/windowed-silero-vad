@@ -20,7 +20,7 @@ SMOOTH_METHOD=${SMOOTH_METHOD:-ema}          # 平滑方式(ema=改进, mean=线
 # ---- VAD 核心门控 ----
 PROB_THRESHOLD=${PROB_THRESHOLD:-0.4}        # IDLE→ACTIVE 进入阈值(平滑概率)
 EXIT_PROB_THRESHOLD=${EXIT_PROB_THRESHOLD:-0.25}  # ACTIVE 维持阈值(<进入,保尾音)
-VOLUME_THRESHOLD=${VOLUME_THRESHOLD:--30}    # 最低音量门限(dB)
+VOLUME_THRESHOLD=${VOLUME_THRESHOLD:--48}    # 最低音量门限(dB)
 SNR_MARGIN_DB=${SNR_MARGIN_DB:-28}           # IDLE 进入需高于噪声底的 dB
 ACTIVE_SNR_MARGIN_DB=${ACTIVE_SNR_MARGIN_DB:-0}   # ACTIVE 维持需高于噪声底的 dB
 NOISE_FLOOR_WINDOW=${NOISE_FLOOR_WINDOW:-120}     # 噪声底估计窗(chunk数)
